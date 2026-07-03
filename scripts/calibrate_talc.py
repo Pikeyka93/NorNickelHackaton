@@ -184,12 +184,15 @@ def _set_params(params: dict) -> None:
 
 
 def evaluate(params: dict, samples: list[CalibSample]) -> dict:
-    """Прогнать detect_talc с данными params по всем сэмплам, вернуть метрики."""
+    """Гоняет ТОЧНО тот же путь, что и продакшен — segment.segment_talc(bgr)
+    (тайлинг + per-tile нормализация), а не укороченную "как в analyze_image"
+    версию. На снимках в датасете (крупнее TILE_SIZE) тайлинг эмпирически стоит
+    примерно столько же, сколько нормализация всего снимка целиком — так что
+    упрощаем и везде считаем честно, без риска разъехаться с реальным инференсом."""
     _set_params(params)
     errs, ious = [], []
     for s in samples:
-        norm = segment.normalize_illumination(s.bgr)
-        pred = segment.detect_talc(norm)
+        pred = segment.segment_talc(s.bgr)
         pred_pct = segment.talc_percentage(pred)
         errs.append(abs(pred_pct - s.gt_pct))
         inter = int(((pred > 0) & (s.gt_mask > 0)).sum())
@@ -263,6 +266,13 @@ def main() -> None:
     ap.add_argument("--apply", action="store_true",
                     help="переписать TALC_* в config.py лучшими найденными значениями")
     ap.add_argument("--report", default=str(C.REPORTS_DIR / "talc_calibration.json"))
+    ap.add_argument("--resume-from", default=None,
+                    help="JSON-отчёт предыдущего запуска (--report) — продолжить поиск "
+                         "от его best.params вместо текущих значений config.py. Удобно "
+                         "дробить долгий поиск на несколько коротких запусков подряд.")
+    ap.add_argument("--time-budget-sec", type=float, default=None,
+                    help="остановить перебор (не начинать новую попытку), если вышло время — "
+                         "для запуска короткими кусками под ограничение по времени вызова")
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -286,21 +296,42 @@ def main() -> None:
     baseline_metrics = evaluate(baseline_params, samples)
     print(f"[calibrate_talc] базовые (текущие) параметры: {baseline_metrics}")
 
+    # --resume-from: продолжаем поиск от лучшей точки предыдущего запуска, а не от
+    # config.py — так можно дробить долгий перебор на много коротких запусков подряд.
+    start_params, start_metrics = baseline_params, baseline_metrics
+    if args.resume_from:
+        prev = json.loads(Path(args.resume_from).read_text(encoding="utf-8"))
+        start_params = prev["best"]["params"]
+        start_metrics = evaluate(start_params, samples)  # пересчитываем на ТЕКУЩЕЙ выборке
+        print(f"[calibrate_talc] продолжаю от {args.resume_from}: {start_metrics}")
+
     rng = random.Random(args.seed)
-    best_params, best_metrics = baseline_params, baseline_metrics
+    best_params, best_metrics = start_params, start_metrics
+    deadline = (time.time() + args.time_budget_sec) if args.time_budget_sec else None
     t0 = time.time()
+    trials_done = 0
     for i in range(args.trials):
+        if deadline and time.time() >= deadline:
+            print(f"  [{i:4d}] закончилось время (--time-budget-sec) — останавливаю перебор")
+            break
         trial = random_params(rng)
         m = evaluate(trial, samples)
+        trials_done += 1
         if score(m) < score(best_metrics):
             best_params, best_metrics = trial, m
             print(f"  [{i:4d}] new best: mean_err={m['mean_abs_err_pct']:.2f}% "
                   f"iou={m['mean_iou']:.3f}")
+    refine_steps = args.refine_steps
+    if deadline:
+        remaining = deadline - time.time()
+        per_eval = (time.time() - t0) / max(trials_done, 1)
+        refine_steps = max(0, min(refine_steps, int(remaining / max(per_eval, 0.01))))
     best_params, best_metrics = coordinate_refine(
-        best_params, best_metrics, samples, rng, steps=args.refine_steps)
+        best_params, best_metrics, samples, rng, steps=refine_steps)
     dt = time.time() - t0
+    print(f"[calibrate_talc] сделано: {trials_done} случайных попыток + {refine_steps} шагов уточнения")
 
-    print(f"\n[calibrate_talc] готово за {dt:.1f}s. Лучшее:")
+    print(f"\n[calibrate_talc] готово за {dt:.1f}s (честная оценка, с тайлингом как в проде). Лучшее:")
     print(f"  mean_abs_err_pct = {best_metrics['mean_abs_err_pct']:.2f}%  "
           f"(цель <= 3%)   mean_iou = {best_metrics['mean_iou']:.3f}")
     for k, v in best_params.items():
