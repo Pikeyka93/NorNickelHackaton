@@ -108,8 +108,9 @@ async def report_pdf(file: UploadFile = File(...)) -> StreamingResponse:
 
     pdf_path = report.build_pdf(result, original_png=original_png,
                                 talc_overlay_png=talc_overlay_png)
+    fname = result.get("image_id", "report")
     return StreamingResponse(
         open(pdf_path, "rb"),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{result["image_id"]}.pdf"'},
+        headers={"Content-Disposition": f'attachment; filename="{fname}.pdf"'},
     )

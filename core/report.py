@@ -37,8 +37,9 @@ _FONT_CANDIDATES = [
 def verdict_text(result: dict) -> str:
     """Краткое заключение, напр.:
     'Руда классифицирована как оталькованная: тальк — 14.0%. вердикт talc согласуется: талька 14.0%'."""
-    ru = C.CLASS_RU.get(result["verdict"], result["verdict"])
-    return (f"Руда классифицирована как {ru}: тальк — {result['talc_pct']}%. "
+    verdict = result.get("verdict", C.CLASS_ORDINARY)
+    ru = C.CLASS_RU.get(verdict, verdict)
+    return (f"Руда классифицирована как {ru}: тальк — {result.get('talc_pct', 0.0)}%. "
             f"{result.get('consistency_check', '')}").strip()
 
 
@@ -93,7 +94,8 @@ def build_pdf(result: dict, out_path: Optional[Path] = None,
     from reportlab.platypus import (Image as RLImage, Paragraph, SimpleDocTemplate,
                                     Spacer, Table, TableStyle)
 
-    out_path = Path(out_path) if out_path else (C.REPORTS_DIR / f"{result['image_id']}.pdf")
+    image_id = result.get("image_id", "report")
+    out_path = Path(out_path) if out_path else (C.REPORTS_DIR / f"{image_id}.pdf")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     font = _register_font()
@@ -103,12 +105,13 @@ def build_pdf(result: dict, out_path: Optional[Path] = None,
     doc = SimpleDocTemplate(str(out_path), pagesize=A4,
                             leftMargin=1.5 * cm, rightMargin=1.5 * cm,
                             topMargin=1.5 * cm, bottomMargin=1.5 * cm)
-    ru = C.CLASS_RU.get(result["verdict"], result["verdict"])
+    verdict = result.get("verdict", C.CLASS_ORDINARY)
+    ru = C.CLASS_RU.get(verdict, verdict)
     conf = result.get("classifier_confidence")
     conf_str = f"{conf:.2f}" if isinstance(conf, (int, float)) else "—"
     story = [
         Paragraph("Отчёт анализа аншлифа", h1),
-        Paragraph(f"ID образца: {result['image_id']}", body),
+        Paragraph(f"ID образца: {image_id}", body),
         Spacer(1, 6),
         Paragraph(f"Сорт руды (вердикт): <b>{ru}</b> (уверенность: {conf_str})", body),
         Paragraph(verdict_text(result), body),
@@ -118,7 +121,7 @@ def build_pdf(result: dict, out_path: Optional[Path] = None,
     data = [
         ["Метрика", "Значение"],
         ["Сорт руды", ru],
-        ["Доля талька, %", result["talc_pct"]],
+        ["Доля талька, %", result.get("talc_pct", 0.0)],
         ["Согласованность", result.get("consistency_check", "")],
     ]
     table = Table(data, colWidths=[6 * cm, 9 * cm])

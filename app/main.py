@@ -94,8 +94,9 @@ for file in files:
 
     all_results.append(result)
 
-    verdict_ru = C.CLASS_RU.get(result["verdict"], result["verdict"])
-    color = _VERDICT_COLOR.get(result["verdict"], "#333")
+    verdict = result.get("verdict", C.CLASS_ORDINARY)
+    verdict_ru = C.CLASS_RU.get(verdict, verdict)
+    color = _VERDICT_COLOR.get(verdict, "#333")
     st.markdown(f"### Сорт руды: <span style='color:{color}'>{verdict_ru}</span>",
                 unsafe_allow_html=True)
     st.write(report.verdict_text(result))
@@ -109,7 +110,7 @@ for file in files:
     with col_img:
         st.markdown("**Маска талька** &nbsp; " + _LEGEND, unsafe_allow_html=True)
         try:
-            overlay = _decode_png_b64(result["talc_mask_png_b64"])
+            overlay = _decode_png_b64(result.get("talc_mask_png_b64", ""))
             original = _decode_original(data)
             if overlay is None:
                 overlay = original  # заглушка без сегментации
@@ -128,7 +129,7 @@ for file in files:
 
     with col_metrics:
         st.markdown("**Метрики**")
-        st.metric("Доля талька, %", result["talc_pct"])
+        st.metric("Доля талька, %", result.get("talc_pct", 0.0))
         st.info("🔎 " + result.get("consistency_check", ""))
         if isinstance(conf, (int, float)):
             st.metric("Уверенность классификатора", round(conf, 3))
@@ -136,14 +137,14 @@ for file in files:
         try:
             import cv2
             original = _decode_original(data)
-            overlay = _decode_png_b64(result["talc_mask_png_b64"])
+            overlay = _decode_png_b64(result.get("talc_mask_png_b64", ""))
             orig_png = cv2.imencode(".png", cv2.cvtColor(original, cv2.COLOR_RGB2BGR))[1].tobytes()
             ov_png = (cv2.imencode(".png", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))[1].tobytes()
                       if overlay is not None else None)
             pdf_path = report.build_pdf(result, original_png=orig_png, talc_overlay_png=ov_png)
             st.download_button("📄 Скачать PDF-отчёт", data=open(pdf_path, "rb").read(),
-                               file_name=f"{result['image_id']}.pdf", mime="application/pdf",
-                               key=f"pdf_{file.name}")
+                               file_name=f"{result.get('image_id', 'report')}.pdf",
+                               mime="application/pdf", key=f"pdf_{file.name}")
         except Exception as e:
             st.caption(f"PDF недоступен: {e}")
 
