@@ -25,9 +25,9 @@
 | API | `api/main.py` | P3 | `/analyze`, `/analyze/batch`, `/export/csv`, `/report/pdf`, логи | ✅ готов |
 | Зависимости | `requirements.txt` | P3 | torch/torchvision зафиксированы под cu121; `--no-cache-dir` | ✅ готов |
 | Docker | `Dockerfile` | P3 | CUDA 12.2, проверка GPU; не ломать деплой | ✅ готов |
-| UI | `app/main.py` | P4 | вердикт, синяя маска талька (зум), `talc_pct`, `consistency_check`, экспорт; `analyze()` в try/except | ✅ готов |
+| UI | `app/main.py` | P4 | вердикт, синяя маска талька (drag + зум колесом), `talc_pct`, `consistency_check`, экспертная проверка, экспорт; `analyze()` в try/except | ✅ готов |
 | Отчёты | `core/report.py` | P4 | CSV + PDF (тальк-only), Cyrillic-шрифт | ✅ готов |
-| Демо/сдача | — | P4 | видео ≤5 мин, презентация, живая ссылка, архив кода | ⬜ TODO |
+| Демо/сдача | `docs/`, `notebooks/P4_interface_report.ipynb` | P4 | видео ≤5 мин, презентация, живая ссылка, архив кода | 🟡 PPTX/ноутбук/каркас готовы, финальные ссылки/видео заполнить |
 
 ## Как запустить
 ```bash

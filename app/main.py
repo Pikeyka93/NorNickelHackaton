@@ -20,7 +20,10 @@ Run:  streamlit run app/main.py
 from __future__ import annotations
 
 import base64
+import io
+import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -30,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 import config as C
 from core import analyze as analyze_mod
@@ -46,6 +50,12 @@ _VERDICT_COLOR = {"ordinary": "#1a9e4b", "hard_to_process": "#c23b22", "talc": "
 _VERDICT_BG = {"ordinary": "#eaf7ee", "hard_to_process": "#fdecea", "talc": "#e9f0fd"}
 _VERDICT_ICON = {"ordinary": "⛰️", "hard_to_process": "⛏️", "talc": "\U0001F9F4"}
 _LEGEND = '<span style="color:#1656c9;font-size:1.15em;">■</span> тальк (синяя маска)'
+
+
+@st.cache_data(show_spinner=False)
+def _cached_analyze(data: bytes, image_id: str) -> dict:
+    return analyze_mod.analyze(data, image_id=image_id)
+
 
 _CSS = """
 <style>
@@ -222,9 +232,13 @@ def _decode_png_b64(b64: str) -> np.ndarray | None:
 
 def _decode_original(data: bytes) -> np.ndarray:
     """RGB-оригинал в том же разрешении, что и analyze()."""
-    import cv2
-    from core import segment
-    return cv2.cvtColor(segment.read_image_bgr(data), cv2.COLOR_BGR2RGB)
+    try:
+        import cv2
+        from core import segment
+        return cv2.cvtColor(segment.read_image_bgr(data), cv2.COLOR_BGR2RGB)
+    except Exception:
+        from PIL import Image
+        return np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
 
 
 def _zoom(img: np.ndarray, factor: float, cx: float, cy: float) -> np.ndarray:
@@ -235,6 +249,182 @@ def _zoom(img: np.ndarray, factor: float, cx: float, cy: float) -> np.ndarray:
     y0 = int(np.clip(cy * h - ch / 2, 0, h - ch))
     x0 = int(np.clip(cx * w - cw / 2, 0, w - cw))
     return img[y0:y0 + ch, x0:x0 + cw]
+
+
+def _array_to_data_url(img: np.ndarray, max_side: int = 2200) -> str:
+    from PIL import Image
+    arr = img.astype(np.uint8) if img.dtype != np.uint8 else img
+    h, w = arr.shape[:2]
+    pil = Image.fromarray(arr)
+    if max(h, w) > max_side:
+        scale = max_side / max(h, w)
+        pil = pil.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                         Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _viewer_id(key: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", key)
+
+
+def _interactive_viewer(img: np.ndarray | None, key: str, height: int = 520) -> None:
+    """HTML viewer: mouse drag pan, wheel zoom, double-click reset."""
+    if img is None:
+        return
+
+    root_id = f"viewer_{_viewer_id(key)}"
+    data_url = _array_to_data_url(img)
+    components.html(
+        f"""
+        <div id="{root_id}" class="ore-viewer">
+          <div class="ore-viewer__tools">
+            <button type="button" data-action="out" title="Уменьшить">−</button>
+            <button type="button" data-action="reset" title="Сбросить">↺</button>
+            <button type="button" data-action="in" title="Увеличить">+</button>
+          </div>
+          <div class="ore-viewer__stage">
+            <img src="{data_url}" alt="ore section" draggable="false" />
+          </div>
+        </div>
+        <style>
+          #{root_id} {{
+            height: {height}px;
+            width: 100%;
+            box-sizing: border-box;
+            font-family: Manrope, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          }}
+          #{root_id} .ore-viewer__tools {{
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            height: 34px;
+            margin-bottom: 8px;
+          }}
+          #{root_id} button {{
+            width: 34px;
+            height: 34px;
+            border: 1px solid #b9c8e7;
+            border-radius: 10px;
+            background: #ffffff;
+            color: #17284d;
+            font-size: 18px;
+            font-weight: 800;
+            line-height: 1;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(20, 30, 60, .08);
+          }}
+          #{root_id} button:hover {{
+            border-color: #1656c9;
+            color: #1656c9;
+          }}
+          #{root_id} .ore-viewer__stage {{
+            position: relative;
+            height: calc(100% - 42px);
+            overflow: hidden;
+            border: 1px solid #d9e2f3;
+            border-radius: 16px;
+            background: #0f172a;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,.04);
+          }}
+          #{root_id} img {{
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            max-width: 100%;
+            max-height: 100%;
+            transform-origin: center center;
+            user-select: none;
+            cursor: grab;
+            will-change: transform;
+          }}
+          #{root_id}.is-dragging img {{
+            cursor: grabbing;
+          }}
+        </style>
+        <script>
+          (() => {{
+            const root = document.getElementById({json.dumps(root_id)});
+            const stage = root.querySelector('.ore-viewer__stage');
+            const img = root.querySelector('img');
+            const tools = root.querySelector('.ore-viewer__tools');
+            const state = {{ scale: 1, tx: 0, ty: 0, dragging: false, x: 0, y: 0 }};
+
+            function apply() {{
+              img.style.transform =
+                `translate(-50%, -50%) translate(${{state.tx}}px, ${{state.ty}}px) scale(${{state.scale}})`;
+            }}
+
+            function zoomAt(nextScale, clientX, clientY) {{
+              const oldScale = state.scale;
+              nextScale = Math.max(1, Math.min(8, nextScale));
+              if (nextScale === oldScale) return;
+              const rect = stage.getBoundingClientRect();
+              const localX = clientX - rect.left - rect.width / 2 - state.tx;
+              const localY = clientY - rect.top - rect.height / 2 - state.ty;
+              const ratio = nextScale / oldScale;
+              state.tx -= localX * (ratio - 1);
+              state.ty -= localY * (ratio - 1);
+              state.scale = nextScale;
+              apply();
+            }}
+
+            function reset() {{
+              state.scale = 1;
+              state.tx = 0;
+              state.ty = 0;
+              apply();
+            }}
+
+            stage.addEventListener('wheel', (event) => {{
+              event.preventDefault();
+              const factor = event.deltaY < 0 ? 1.14 : 0.88;
+              zoomAt(state.scale * factor, event.clientX, event.clientY);
+            }}, {{ passive: false }});
+
+            stage.addEventListener('mousedown', (event) => {{
+              if (event.button !== 0) return;
+              state.dragging = true;
+              state.x = event.clientX;
+              state.y = event.clientY;
+              root.classList.add('is-dragging');
+            }});
+
+            window.addEventListener('mousemove', (event) => {{
+              if (!state.dragging) return;
+              state.tx += event.clientX - state.x;
+              state.ty += event.clientY - state.y;
+              state.x = event.clientX;
+              state.y = event.clientY;
+              apply();
+            }});
+
+            window.addEventListener('mouseup', () => {{
+              state.dragging = false;
+              root.classList.remove('is-dragging');
+            }});
+
+            stage.addEventListener('dblclick', reset);
+            tools.addEventListener('click', (event) => {{
+              const action = event.target?.dataset?.action;
+              const rect = stage.getBoundingClientRect();
+              const cx = rect.left + rect.width / 2;
+              const cy = rect.top + rect.height / 2;
+              if (action === 'in') zoomAt(state.scale * 1.25, cx, cy);
+              if (action === 'out') zoomAt(state.scale / 1.25, cx, cy);
+              if (action === 'reset') reset();
+            }});
+
+            img.addEventListener('load', apply);
+            apply();
+          }})();
+        </script>
+        """,
+        height=height,
+        scrolling=False,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -380,7 +570,7 @@ for file in files:
     # analyze() в try/except: кривой файл не должен ронять всё приложение (живой деплой!)
     try:
         with st.spinner(f"Анализирую {file.name}…"):
-            result = analyze_mod.analyze(data, image_id=file.name)
+            result = _cached_analyze(data, file.name)
     except Exception as e:
         st.error(f"Не удалось обработать «{file.name}»: {e}. "
                  "Проверьте, что это корректное изображение аншлифа.")
@@ -420,16 +610,11 @@ for file in files:
             original = _decode_original(data)
             if overlay is None:
                 overlay = original  # заглушка без сегментации
-            z = st.slider("Зум", 1.0, 6.0, 1.0, 0.5, key=f"z_{file.name}")
-            if z > 1.0:
-                c1, c2 = st.columns(2)
-                cx = c1.slider("центр X", 0.0, 1.0, 0.5, 0.05, key=f"cx_{file.name}")
-                cy = c2.slider("центр Y", 0.0, 1.0, 0.5, 0.05, key=f"cy_{file.name}")
-            else:
-                cx = cy = 0.5
             tab_ov, tab_orig = st.tabs(["\U0001F535 Тальк-маска", "\U0001F5BC️ Оригинал"])
-            tab_ov.image(_zoom(overlay, z, cx, cy), use_container_width=True)
-            tab_orig.image(_zoom(original, z, cx, cy), use_container_width=True)
+            with tab_ov:
+                _interactive_viewer(overlay, key=f"{file.name}_overlay", height=540)
+            with tab_orig:
+                _interactive_viewer(original, key=f"{file.name}_original", height=540)
         except Exception as e:
             st.warning(f"Не удалось отрисовать маску: {e}")
 
@@ -438,6 +623,49 @@ for file in files:
             st.write(f"ID образца: `{result.get('image_id', '')}`")
             st.write(f"Источник вердикта: `{result.get('verdict_source', '?')}`")
             st.write(f"Время обработки: {result.get('processing_time_sec', 0):.2f} с")
+
+        with st.expander("\U0001F9D1‍\U0001F52C Экспертная проверка", expanded=False):
+            review_status = st.radio(
+                "Решение геолога",
+                ["Подтвердить вердикт", "Исправить сорт"],
+                horizontal=True,
+                key=f"review_status_{file.name}",
+            )
+            corrected = None
+            if review_status == "Исправить сорт":
+                corrected = st.selectbox(
+                    "Правильный сорт",
+                    options=C.CLASSES,
+                    format_func=lambda x: C.CLASS_RU.get(x, x),
+                    key=f"corrected_{file.name}",
+                )
+            comment = st.text_area("Комментарий", height=88, key=f"comment_{file.name}")
+            review_payload = {
+                "image_id": result.get("image_id", ""),
+                "model_verdict": result.get("verdict", ""),
+                "expert_status": review_status,
+                "expert_verdict": corrected,
+                "expert_comment": comment,
+                "talc_pct": result.get("talc_pct", ""),
+                "consistency_check": result.get("consistency_check", ""),
+            }
+            st.download_button(
+                "\U0001F4DD Скачать экспертную правку",
+                data=json.dumps(review_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name=f"{Path(file.name).stem}_review.json",
+                mime="application/json",
+                key=f"review_json_{file.name}",
+                use_container_width=True,
+            )
+
+        st.download_button(
+            "\U0001F9FE Скачать JSON результата",
+            data=json.dumps(result, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name=f"{Path(file.name).stem}_result.json",
+            mime="application/json",
+            key=f"result_json_{file.name}",
+            use_container_width=True,
+        )
 
         try:
             import cv2

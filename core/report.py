@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import re
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -83,6 +84,13 @@ def _register_font() -> str:
     return "Helvetica"
 
 
+def _safe_report_stem(image_id: str) -> str:
+    """Keep uploaded filenames from becoming nested report paths."""
+    stem = Path(str(image_id) or "report").name
+    stem = re.sub(r"[^A-Za-zА-Яа-я0-9_.-]+", "_", stem).strip("._")
+    return stem or "report"
+
+
 def build_pdf(result: dict, out_path: Optional[Path] = None,
               original_png: Optional[bytes] = None,
               talc_overlay_png: Optional[bytes] = None) -> Path:
@@ -95,7 +103,7 @@ def build_pdf(result: dict, out_path: Optional[Path] = None,
                                     Spacer, Table, TableStyle)
 
     image_id = result.get("image_id", "report")
-    out_path = Path(out_path) if out_path else (C.REPORTS_DIR / f"{image_id}.pdf")
+    out_path = Path(out_path) if out_path else (C.REPORTS_DIR / f"{_safe_report_stem(image_id)}.pdf")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     font = _register_font()
