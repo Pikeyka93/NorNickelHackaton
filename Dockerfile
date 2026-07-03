@@ -1,3 +1,7 @@
+# ============================================================
+# ВЛАДЕЛЕЦ: P3 (Docker + стабильность деплоя)
+# TODO(P3): держать образ рабочим; --no-cache-dir уже включён (PIP_NO_CACHE_DIR=1).
+# ============================================================
 # CUDA 12.2 runtime to match the L4 server (CUDA 12.2). Build the image once, run
 # API and UI from it. IMPORTANT: run with `--gpus all` so the container sees the GPU.
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04

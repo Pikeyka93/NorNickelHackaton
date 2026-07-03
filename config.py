@@ -1,9 +1,14 @@
+# ============================================================
+# ВЛАДЕЛЕЦ: общий (менять согласованно — от config зависят все треки)
+# TODO(P1): откалибровать TALC_* по синим обводкам (цель: ошибка talc_pct ±3%)
+# TODO(P2): при желании вынести гиперпараметры классификатора в отдельный конфиг
+# ============================================================
 """
 Central configuration: paths, class names, thresholds.
 
-Everything tunable lives here so the 3 tracks (classifier / segmentation / API-UI)
-share one source of truth. Values that need calibration on the real data are marked
-with TODO and carry a sane default so the code runs out of the box.
+Scope (по уточнениям жюри): сегментируем ТОЛЬКО тальк; сорт руды определяет
+классификатор. Порогов срастаний здесь больше нет.
+Значения, требующие калибровки на данных, помечены TODO и имеют рабочий дефолт.
 """
 from __future__ import annotations
 
@@ -20,14 +25,13 @@ def _env_path(var: str, default: Path) -> Path:
 
 
 # --- Data ------------------------------------------------------------------
-# Dataset lives on the server (cyrillic + spaces). NEVER commit it (see .gitignore).
-# Override with:  export DATA_DIR="/some/path"
+# Датасет на сервере (кириллица + пробелы). НЕ коммитить. Override: export DATA_DIR=...
 DATA_DIR = _env_path(
     "DATA_DIR",
     Path.home() / "dataset" / "Задача 3. Скажи мне, кто твой шлиф",
 )
 
-# Subfolders inside DATA_DIR that hold the per-class images.
+# Подпапки внутри DATA_DIR
 PART1_DIR = "Фото руд по сортам. ч1"
 PART2_DIR = "Фото руд по сортам. ч2"
 PANORAMA_DIR = "Панорамы"
@@ -49,66 +53,60 @@ CLASSES = [CLASS_ORDINARY, CLASS_HARD, CLASS_TALC]
 CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
 IDX_TO_CLASS = {i: c for c, i in CLASS_TO_IDX.items()}
 
-# Human-readable (RU) labels for reports / UI.
 CLASS_RU = {
     CLASS_ORDINARY: "рядовая",
     CLASS_HARD: "труднообогатимая",
     CLASS_TALC: "оталькованная",
 }
 
-# --- Verdict logic ---------------------------------------------------------
-# Expert rule: talc > 10% => talc; else ordinary vs fine by which dominates.
+# --- Verdict / consistency -------------------------------------------------
+# Порог для эвристики согласованности и для fallback-вердикта без классификатора.
 TALC_VERDICT_THRESHOLD_PCT = 10.0
 
 # --- Classifier ------------------------------------------------------------
-CLASSIFIER_BACKBONE = os.environ.get("CLASSIFIER_BACKBONE", "efficientnet_b0")  # or "resnet50"
-IMG_SIZE = 320                       # input resolution for the classifier
+CLASSIFIER_BACKBONE = os.environ.get("CLASSIFIER_BACKBONE", "efficientnet_b0")  # или "resnet50"
+IMG_SIZE = 320
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 EPOCHS = int(os.environ.get("EPOCHS", "15"))
 LR = float(os.environ.get("LR", "3e-4"))
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "4"))
 VAL_FRACTION = 0.2
 RANDOM_SEED = 42
-# ImageNet normalisation (pretrained backbones).
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-# --- Segmentation (classical CV) -------------------------------------------
-# Tiling for panoramas: process in overlapping tiles, never load-and-process 10k^2 at once.
+# --- Talc segmentation (classical CV) --------------------------------------
+# Тальк = рассеянная ТЁМНАЯ фаза в нерудной матрице. Детектор: локально-адаптивный
+# порог «темнее локального фона» + низкая текстура. Фиксированный порог по сырому
+# снимку не работает (снимки от почти чёрных до жёлтых) => сначала нормализация.
+# TODO(P1): откалибровать по синим обводкам, цель talc_pct ±3%.
+TALC_BRIGHT_EXCLUDE_PERCENTILE = 85  # ярче этого => рудная/светлая фаза, не тальк
+TALC_DARK_PERCENTILE = 50            # перцентиль матрицы как уровень нерудного фона (50 = медиана)
+TALC_ABS_MARGIN = 25.0               # на столько темнее фона по АБСОЛЮТУ (ловит интерьер больших зон)
+TALC_LOCAL_WINDOW = 101              # px, окно оценки локального фона (нечётное)
+TALC_LOCAL_MARGIN = 8.0              # на столько темнее ЛОКАЛЬНОГО фона (края/остаточный градиент)
+TALC_MAX_TEXTURE = 0.08              # потолок норм. локальной дисперсии (тальк гладкий)
+TALC_MIN_BLOB_AREA = 200             # px, отбрасывать мелкие крапинки
+# Регион-контраст: тальк должен быть темнее ОКРУЖАЮЩЕГО гангу (а не просто тёмным).
+# Отсекает плавные тёмные вариации нерудной матрицы (ложные срабатывания).
+TALC_BG_WINDOW = 301                 # px, окно оценки фона по гангу (исключая тёмные кандидаты)
+TALC_CONTRAST_MARGIN = 24.0          # тальк темнее окружающего гангу на столько интенсивностей
+# ^ выше амплитуды яркостных вариаций гангу, но ниже контраста тусклого талька.
+#   Ключевой калибровочный порог: ниже -> больше ложного талька, выше -> пропуски.
+
+# Тайлинг панорам (вход инференса): обрабатывать тайлами с перекрытием, не грузить 10k^2.
 TILE_SIZE = 1024
 TILE_OVERLAP = 128
-# Guard against pathological loads; above this longest side we downscale before masking
-# (percentages are scale-invariant). TODO: swap for true lazy tiling (pyvips/tifffile).
-MAX_PROCESS_SIDE = 8000
+MAX_PROCESS_SIDE = 8000              # выше — даунскейл (доли масштабно-инвариантны)
+# TODO(P1): для многогигабайтных TIFF заменить даунскейл на ленивый тайлинг (pyvips/tifffile).
 
-# Sulfide detection: bright phase. Otsu offset lets us bias the auto threshold.
-# TODO: calibrate offset on labelled slides.
-SULFIDE_OTSU_OFFSET = 0.0            # added to Otsu threshold (0-255 scale)
-SULFIDE_MIN_BLOB_AREA = 25          # px; drop specks below this after thresholding
-
-# Ordinary vs fine intergrowth (per sulfide blob morphology).
-# Big / compact / high-solidity -> ordinary (green); small / ragged -> fine (red).
-# TODO: calibrate these cut-offs against expert examples.
-INTERGROWTH_SOLIDITY_CUT = 0.85     # >= => tends ordinary
-INTERGROWTH_AREA_CUT = 1500         # px; >= => tends ordinary
-INTERGROWTH_COMPACTNESS_CUT = 30.0  # perimeter^2/area; < => compact => ordinary
-
-# Talc: dark, scattered, low-texture phase in the non-sulfide matrix.
-# TODO: calibrate against the expert BLUE outlines (target talc error <= +-3%).
-TALC_DARK_PERCENTILE = 25           # pixels darker than this local percentile are talc candidates
-TALC_LOCAL_WINDOW = 51              # px; window for local adaptive darkness
-TALC_MAX_TEXTURE = 0.06             # normalised local variance ceiling (smooth => talc)
-TALC_MIN_BLOB_AREA = 200            # px; drop tiny talc specks
-
-# Blue expert-outline extraction (calibration only) in HSV.
+# Синие экспертные обводки (ground truth талька для калибровки) в HSV.
 BLUE_HSV_LOWER = (90, 60, 40)
 BLUE_HSV_UPPER = (140, 255, 255)
 
-# --- Colours for the phase mask (BGR for OpenCV) ---------------------------
-COLOR_ORDINARY = (0, 200, 0)     # green
-COLOR_FINE = (0, 0, 220)         # red
-COLOR_TALC = (220, 0, 0)         # blue
-MASK_ALPHA = 0.45                # overlay opacity
+# --- Цвет маски талька (BGR для OpenCV) ------------------------------------
+COLOR_TALC = (220, 0, 0)             # синий
+MASK_ALPHA = 0.45                    # прозрачность наложения
 
 # --- API / logging ---------------------------------------------------------
 ANALYZE_LOG = LOG_DIR / "analyze.log"

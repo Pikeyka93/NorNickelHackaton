@@ -1,45 +1,47 @@
+# ============================================================
+# ВЛАДЕЛЕЦ: P1 (сегментация талька)
+# TODO(P1):
+#   - откалибровать TALC_* в config.py по синим обводкам (extract_blue_annotations),
+#     цель: ошибка talc_pct ±3% (IoU/расхождение доли — см. notebooks/README.md);
+#   - проверить бюджет тайлинга на реальной панораме (≤5 мин);
+#   - при необходимости — ленивый тайлинг (pyvips/tifffile) вместо даунскейла.
+# ============================================================
 """
-Classical-CV segmentation of aншлиф phases -> color mask + area percentages.
+Классический CV: сегментация ТОЛЬКО талька -> синяя маска поверх снимка + talc_pct.
 
-Pipeline (per the brief):
-  1. per-image (per-tile) illumination normalisation  -- MUST come first
-  2. sulfide detection: Otsu on the *normalised* brightness
-  3. ordinary vs fine intergrowth: morphology of sulfide blobs (solidity/compactness)
-  4. talc: locally-dark + low-texture regions in the non-sulfide matrix
-  5. compose green/red/blue mask, compute % of total slide area
-Panoramas are processed in overlapping TILES so we never run heavy ops on 10k^2 at once.
+По уточнениям жюри срастания НЕ сегментируем (разметки по ним нет). Единственная
+пиксельная разметка — синие обводки оталькования, поэтому оценивается только тальк.
 
-`extract_blue_annotations` pulls the expert's blue outlines — the only pixel-level
-ground truth we have — for calibrating the talc detector (see notebooks/).
-
-All thresholds live in config.py with TODO calibration notes.
+Пайплайн:
+  1. per-image (per-tile) нормализация освещения   -- ОБЯЗАТЕЛЬНО первым шагом
+  2. детекция талька: тёмная гладкая фаза, темнее локального фона, в нерудной матрице
+  3. синяя маска талька поверх снимка + доля талька от всей площади
+Панорамы (вход инференса) — тайлами с перекрытием.
+`extract_blue_annotations` достаёт эталон талька из синих обводок для калибровки.
 """
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Iterator, Optional, Union
+from typing import Iterator, Union
 
 import cv2
 import numpy as np
 
 import config as C
 
-# skimage is optional: we use LBP texture if present, else a cv2 local-variance fallback.
+# skimage не обязателен: если нет — используем cv2-фолбэк локальной дисперсии.
 try:
     from skimage.feature import local_binary_pattern  # noqa: F401
     _HAS_SKIMAGE = True
 except Exception:  # pragma: no cover
     _HAS_SKIMAGE = False
 
-# Allow very large panoramas through PIL if we ever route via it.
 try:
     from PIL import Image
     Image.MAX_IMAGE_PIXELS = None
 except Exception:  # pragma: no cover
     Image = None
 
-ImageInput = Union[str, Path, bytes, np.ndarray]
-_K3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+ImageInput = Union[str, "bytes", np.ndarray]
 _K5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
 
@@ -47,9 +49,8 @@ _K5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 # I/O
 # --------------------------------------------------------------------------- #
 def read_image_bgr(source: ImageInput, max_side: int = C.MAX_PROCESS_SIDE) -> np.ndarray:
-    """Load any supported input into a BGR uint8 array, downscaling if a side exceeds
-    `max_side` (percentages are scale-invariant, so this is safe and bounds memory).
-    TODO: for true multi-GB TIFFs, replace with lazy tiling via pyvips/tifffile."""
+    """Любой вход -> BGR uint8, с даунскейлом если сторона больше max_side (доли
+    масштабно-инвариантны). TODO(P1): для многогигабайтных TIFF — ленивый тайлинг."""
     if isinstance(source, np.ndarray):
         img = source
         if img.ndim == 2:
@@ -60,137 +61,102 @@ def read_image_bgr(source: ImageInput, max_side: int = C.MAX_PROCESS_SIDE) -> np
         arr = np.frombuffer(source, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
-            raise ValueError("Could not decode image bytes.")
+            raise ValueError("Не удалось декодировать байты изображения.")
     else:  # path
         img = cv2.imread(str(source), cv2.IMREAD_COLOR)
         if img is None:
-            raise FileNotFoundError(f"Could not read image: {source}")
+            raise FileNotFoundError(f"Не удалось прочитать изображение: {source}")
 
     h, w = img.shape[:2]
-    longest = max(h, w)
-    if longest > max_side:
-        scale = max_side / longest
-        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    if max(h, w) > max_side:
+        s = max_side / max(h, w)
+        img = cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
     return img
 
 
 # --------------------------------------------------------------------------- #
-# Step 1: illumination normalisation (per tile)
+# Шаг 1: нормализация освещения (per tile)
 # --------------------------------------------------------------------------- #
 def normalize_illumination(bgr: np.ndarray) -> np.ndarray:
-    """Gray-world white balance + large-scale flat-field division.
+    """Глобальная нормализация: gray-world баланс белого + стандартизация яркости.
 
-    Kills the yellow/dark/bright colour casts so downstream thresholds see comparable
-    brightness across wildly different captures. A FIXED threshold on the raw image
-    would not survive this variation — hence normalise first, always."""
+    Убирает жёлтые/тёмные/светлые касты (снимки от почти чёрных до жёлтых), чтобы
+    пороги текстуры/контраста были сопоставимы между кадрами.
+    ВАЖНО: НЕ делаем пространственный flat-field (деление на размытый фон) — он
+    принял бы КРУПНОЕ тёмное пятно талька за тень и «вычел» бы его. Локальную
+    неравномерность освещения учитывает регион-контраст в detect_talc."""
     f = bgr.astype(np.float32)
 
-    # 1) gray-world white balance: pull each channel to a common mean.
+    # 1) gray-world: каждый канал к общему среднему (убирает цветовой каст)
     means = f.reshape(-1, 3).mean(axis=0) + 1e-6
     f *= (means.mean() / means)
 
-    # 2) flat-field: divide luminance by a heavily-blurred estimate of the background.
+    # 2) стандартизация глобальной яркости: медиану -> 128 (сохраняет пространственную
+    #    структуру, в т.ч. тёмный тальк — только выравнивает общий уровень)
     gray = f.mean(axis=2)
-    k = max(31, (min(bgr.shape[:2]) // 8) | 1)  # odd kernel ~1/8 of the shorter side
-    bg = cv2.GaussianBlur(gray, (k, k), 0) + 1e-6
-    gain = (gray.mean() / bg)[..., None]
-    f *= gain
+    med = float(np.median(gray)) + 1e-6
+    f *= (128.0 / med)
 
     return np.clip(f, 0, 255).astype(np.uint8)
 
 
 # --------------------------------------------------------------------------- #
-# Step 2: sulfides (bright phase)
-# --------------------------------------------------------------------------- #
-def segment_sulfides(norm_bgr: np.ndarray) -> np.ndarray:
-    """Binary mask (0/255) of bright sulfide grains via Otsu on the normalised gray."""
-    gray = cv2.cvtColor(norm_bgr, cv2.COLOR_BGR2GRAY)
-    otsu, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    thr = float(np.clip(otsu + C.SULFIDE_OTSU_OFFSET, 0, 255))
-    mask = (gray >= thr).astype(np.uint8) * 255
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _K3)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _K3)
-    return _drop_small(mask, C.SULFIDE_MIN_BLOB_AREA)
-
-
-# --------------------------------------------------------------------------- #
-# Step 4: talc (dark, smooth, in the matrix)
+# Шаг 2: детекция талька
 # --------------------------------------------------------------------------- #
 def _local_variance(gray_f: np.ndarray, win: int) -> np.ndarray:
-    """Normalised (0..1) local variance via box filters."""
+    """Нормированная (0..1) локальная дисперсия через box-фильтры."""
     mean = cv2.boxFilter(gray_f, -1, (win, win))
     mean_sq = cv2.boxFilter(gray_f * gray_f, -1, (win, win))
     var = np.clip(mean_sq - mean * mean, 0, None)
     return var / (255.0 ** 2)
 
 
-def detect_talc(norm_bgr: np.ndarray, sulfide_mask: np.ndarray) -> np.ndarray:
-    """Talc = matrix pixels that are (a) dark globally, (b) darker than local surroundings,
-    (c) low-texture. Calibrate the thresholds against the blue expert outlines."""
+def detect_talc(norm_bgr: np.ndarray) -> np.ndarray:
+    """Бинарная маска талька (0/255).
+
+    Тальк = пиксели, которые (a) не яркие (нерудная матрица), (d) низкой текстуры, и
+    темнее фона: либо (b) по абсолюту (темнее уровня матрицы на TALC_ABS_MARGIN —
+    ловит ИНТЕРЬЕР больших зон, т.к. после нормализации фон почти ровный), либо
+    (c) темнее локального фона на TALC_LOCAL_MARGIN (края / остаточный градиент).
+    На равномерном фоне без талька результат ~пустой (не раздуваем долю). Калибровать
+    по синим обводкам."""
     gray = cv2.cvtColor(norm_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    matrix = sulfide_mask == 0
+    win = C.TALC_LOCAL_WINDOW | 1
+
+    bright_cut = np.percentile(gray, C.TALC_BRIGHT_EXCLUDE_PERCENTILE)
+    matrix = gray < bright_cut                      # (a) нерудная матрица
     if matrix.sum() < 10:
         return np.zeros(gray.shape, np.uint8)
 
-    # (a) global darkness within the matrix
-    dark_thr = np.percentile(gray[matrix], C.TALC_DARK_PERCENTILE)
-    dark_global = gray < dark_thr
-
-    # (b) locally darker than surroundings
-    win = C.TALC_LOCAL_WINDOW | 1
+    bg = np.percentile(gray[matrix], C.TALC_DARK_PERCENTILE)    # уровень нерудного фона
+    dark_abs = gray < (bg - C.TALC_ABS_MARGIN)                  # (b) абсолютно темнее фона
     local_mean = cv2.boxFilter(gray, -1, (win, win))
-    dark_local = gray < (local_mean - 5.0)
+    dark_local = gray < (local_mean - C.TALC_LOCAL_MARGIN)      # (c) темнее локального фона
+    smooth = _local_variance(gray, win) < C.TALC_MAX_TEXTURE    # (d) гладкий
+    cand = matrix & smooth & (dark_abs | dark_local)
 
-    # (c) smooth (low local variance)
-    smooth = _local_variance(gray, win) < C.TALC_MAX_TEXTURE
+    # (e) регион-контраст: оценить фон по ОКРУЖАЮЩЕМУ гангу (исключая тёмные кандидаты)
+    # и оставить только пиксели, что темнее этого фона -> отсекает плавные тёмные
+    # вариации матрицы, сохраняя интерьер настоящих тальк-зон.
+    win2 = C.TALC_BG_WINDOW | 1
+    gangue = ((~cand) & matrix).astype(np.float32)
+    gsum = cv2.boxFilter(gray * gangue, -1, (win2, win2), normalize=False)
+    gcnt = cv2.boxFilter(gangue, -1, (win2, win2), normalize=False)
+    bg_local = gsum / (gcnt + 1e-6)
+    contrast_ok = (gcnt > 0) & (gray < bg_local - C.TALC_CONTRAST_MARGIN)
 
-    talc = (matrix & dark_global & dark_local & smooth).astype(np.uint8) * 255
+    talc = (cand & contrast_ok).astype(np.uint8) * 255
     talc = cv2.morphologyEx(talc, cv2.MORPH_OPEN, _K5)
     talc = cv2.morphologyEx(talc, cv2.MORPH_CLOSE, _K5)
     return _drop_small(talc, C.TALC_MIN_BLOB_AREA)
 
 
 # --------------------------------------------------------------------------- #
-# Step 3: ordinary vs fine intergrowths (blob morphology, global)
-# --------------------------------------------------------------------------- #
-def classify_intergrowths(sulfide_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Split the sulfide mask into ordinary (green) and fine (red) by per-blob shape.
-
-    Big / compact / high-solidity blobs -> ordinary; small / ragged / low-solidity -> fine.
-    A blob is ordinary if it wins >=2 of the 3 morphology votes (config cut-offs)."""
-    ordinary = np.zeros(sulfide_mask.shape, np.uint8)
-    fine = np.zeros(sulfide_mask.shape, np.uint8)
-
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(sulfide_mask, 8)
-    for i in range(1, n):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if area < C.SULFIDE_MIN_BLOB_AREA:
-            continue
-        comp = (labels == i).astype(np.uint8)
-        cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts:
-            continue
-        cnt = max(cnts, key=cv2.contourArea)
-        peri = cv2.arcLength(cnt, True)
-        hull_area = cv2.contourArea(cv2.convexHull(cnt))
-        solidity = area / (hull_area + 1e-6)
-        compactness = (peri * peri) / (area + 1e-6)  # 4pi for a disk; grows when ragged
-
-        votes = 0
-        votes += solidity >= C.INTERGROWTH_SOLIDITY_CUT
-        votes += area >= C.INTERGROWTH_AREA_CUT
-        votes += compactness < C.INTERGROWTH_COMPACTNESS_CUT
-        (ordinary if votes >= 2 else fine)[comp > 0] = 255
-
-    return ordinary, fine
-
-
-# --------------------------------------------------------------------------- #
-# Blue expert outlines (calibration only)
+# Синие экспертные обводки (эталон для калибровки)
 # --------------------------------------------------------------------------- #
 def extract_blue_annotations(bgr: np.ndarray, fill: bool = True) -> np.ndarray:
-    """Mask of the expert's hand-drawn BLUE talc outlines. If `fill`, flood the interior
-    so the mask is the annotated *region*, not just the line. Use as talc ground truth."""
+    """Маска синих обводок талька (ground truth). При fill — заливка контура, чтобы
+    получить размеченную ОБЛАСТЬ, а не только линию. Обводки полные (жюри)."""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     line = cv2.inRange(hsv, np.array(C.BLUE_HSV_LOWER), np.array(C.BLUE_HSV_UPPER))
     if not fill:
@@ -204,88 +170,61 @@ def extract_blue_annotations(bgr: np.ndarray, fill: bool = True) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# Tiling
+# Тайлинг (панорамы на инференсе)
 # --------------------------------------------------------------------------- #
 def iter_tiles(h: int, w: int, tile: int, overlap: int) -> Iterator[tuple[int, int, int, int]]:
-    """Yield (y0, y1, x0, x1) overlapping tiles covering an h*w image."""
+    """Перекрывающиеся тайлы (y0, y1, x0, x1), покрывающие h*w."""
     step = max(1, tile - overlap)
-    ys = list(range(0, max(1, h - overlap), step))
-    xs = list(range(0, max(1, w - overlap), step))
-    for y0 in ys:
+    for y0 in range(0, max(1, h - overlap), step):
         y1 = min(h, y0 + tile)
-        for x0 in xs:
+        for x0 in range(0, max(1, w - overlap), step):
             x1 = min(w, x0 + tile)
             yield y0, y1, x0, x1
 
 
-def segment_masks(bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Per-tile normalise + sulfide + talc, stitched into full-res masks.
-    Local ops (normalise/threshold) run per tile; global blob morphology runs afterwards."""
+def segment_talc(bgr: np.ndarray) -> np.ndarray:
+    """Полноразмерная маска талька: per-tile нормализация + детекция, сшивка объединением."""
     h, w = bgr.shape[:2]
-    sulf = np.zeros((h, w), np.uint8)
     talc = np.zeros((h, w), np.uint8)
-
     single = (h <= C.TILE_SIZE and w <= C.TILE_SIZE)
     tiles = [(0, h, 0, w)] if single else iter_tiles(h, w, C.TILE_SIZE, C.TILE_OVERLAP)
     for (y0, y1, x0, x1) in tiles:
         norm = normalize_illumination(bgr[y0:y1, x0:x1])
-        s = segment_sulfides(norm)
-        t = detect_talc(norm, s)
-        # union in overlap regions
-        sulf[y0:y1, x0:x1] = np.maximum(sulf[y0:y1, x0:x1], s)
+        t = detect_talc(norm)
         talc[y0:y1, x0:x1] = np.maximum(talc[y0:y1, x0:x1], t)
-
-    talc[sulf > 0] = 0  # talc lives in the non-sulfide matrix
-    return sulf, talc
+    return talc
 
 
 # --------------------------------------------------------------------------- #
-# Compose + metrics
+# Наложение + доля
 # --------------------------------------------------------------------------- #
-def build_color_mask(shape, ordinary, fine, talc) -> np.ndarray:
-    """BGR mask: green=ordinary, red=fine, blue=talc, black elsewhere."""
-    mask = np.zeros((shape[0], shape[1], 3), np.uint8)
-    mask[talc > 0] = C.COLOR_TALC
-    mask[fine > 0] = C.COLOR_FINE
-    mask[ordinary > 0] = C.COLOR_ORDINARY
-    return mask
-
-
-def overlay_mask(bgr: np.ndarray, color_mask: np.ndarray, alpha: float = C.MASK_ALPHA) -> np.ndarray:
+def build_talc_overlay(bgr: np.ndarray, talc_mask: np.ndarray,
+                       alpha: float = C.MASK_ALPHA) -> np.ndarray:
+    """Синяя полупрозрачная маска талька поверх снимка (BGR)."""
     out = bgr.copy()
-    nz = color_mask.any(axis=2)
-    out[nz] = cv2.addWeighted(bgr, 1 - alpha, color_mask, alpha, 0)[nz]
+    blue = np.zeros_like(bgr)
+    blue[:] = C.COLOR_TALC
+    m = talc_mask > 0
+    out[m] = cv2.addWeighted(bgr, 1 - alpha, blue, alpha, 0)[m]
     return out
 
 
-def compute_metrics(ordinary, fine, talc) -> dict:
-    """Percentages of TOTAL slide area (all pixels). ordinary+fine ~= sulfide."""
-    total = ordinary.shape[0] * ordinary.shape[1]
-    o = int((ordinary > 0).sum())
-    f = int((fine > 0).sum())
-    t = int((talc > 0).sum())
-    pct = lambda n: round(100.0 * n / total, 2)
-    return {
-        "sulfide_area_pct": pct(o + f),
-        "ordinary_pct": pct(o),
-        "fine_pct": pct(f),
-        "talc_pct": pct(t),
-    }
+def talc_percentage(talc_mask: np.ndarray) -> float:
+    """Доля талька от ВСЕЙ площади шлифа, %."""
+    total = talc_mask.shape[0] * talc_mask.shape[1]
+    return round(100.0 * int((talc_mask > 0).sum()) / max(total, 1), 2)
 
 
 def analyze_image(source: ImageInput) -> dict:
-    """Full segmentation. Returns metrics + BGR masks/overlay (kept as arrays; the
-    analyze() contract base64-encodes them)."""
+    """Полная тальк-сегментация. Возвращает bgr / talc_pct / talc_mask / overlay (массивы;
+    base64-кодирование — в analyze())."""
     bgr = read_image_bgr(source)
-    sulf, talc = segment_masks(bgr)
-    ordinary, fine = classify_intergrowths(sulf)
-    color_mask = build_color_mask(bgr.shape, ordinary, fine, talc)
+    talc_mask = segment_talc(bgr)
     return {
         "bgr": bgr,
-        "metrics": compute_metrics(ordinary, fine, talc),
-        "color_mask": color_mask,
-        "overlay": overlay_mask(bgr, color_mask),
-        "masks": {"sulfide": sulf, "ordinary": ordinary, "fine": fine, "talc": talc},
+        "talc_pct": talc_percentage(talc_mask),
+        "talc_mask": talc_mask,
+        "overlay": build_talc_overlay(bgr, talc_mask),
     }
 
 
@@ -293,7 +232,6 @@ def analyze_image(source: ImageInput) -> dict:
 # helpers
 # --------------------------------------------------------------------------- #
 def _drop_small(mask: np.ndarray, min_area: int) -> np.ndarray:
-    """Zero out connected components smaller than min_area."""
     if min_area <= 1:
         return mask
     n, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), 8)
@@ -307,5 +245,4 @@ def _drop_small(mask: np.ndarray, min_area: int) -> np.ndarray:
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
-        res = analyze_image(sys.argv[1])
-        print("metrics:", res["metrics"])
+        print("talc_pct:", analyze_image(sys.argv[1])["talc_pct"])

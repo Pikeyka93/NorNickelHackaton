@@ -1,15 +1,26 @@
+# ============================================================
+# ВЛАДЕЛЕЦ: P4 (интеграция контракта) — согласовывать с P1/P2 при смене полей
+# TODO(P4): при появлении карты уверенности — добавить поле confidence_map_b64;
+#           не менять имена полей без апдейта api/main.py и app/main.py.
+# ============================================================
 """
-analyze(image) -> dict  — the single contract the API and UI are built around.
+analyze(image) -> dict — единый контракт, вокруг которого построены API и UI.
 
-Design:
-  * Verdict comes from the CLASSIFIER (track 1); mask + percentages from SEGMENTATION
-    (track 2). They are reconciled so the returned verdict never contradicts the numbers
-    (talc>threshold always wins, per the expert rule).
-  * Degrades gracefully:
-      - no cv2/segmentation available OR ANALYZE_STUB=1  -> stub numbers + empty mask
-        (lets the API/UI team work before the CV/ML is wired in).
-      - no trained classifier weights                    -> rule-based verdict from the
-        segmentation percentages.
+Контракт (по уточнениям жюри):
+{
+  "image_id": str,
+  "verdict": "ordinary" | "hard_to_process" | "talc",   # ТОЛЬКО от классификатора
+  "talc_pct": float,                                     # от тальк-сегментации
+  "talc_mask_png_b64": str,                              # синяя маска талька поверх снимка
+  "consistency_check": str,                              # RU: согласуется ли вердикт с %талька
+  "classifier_confidence": float | null,
+  "processing_time_sec": float
+}
+
+Деградация:
+  - нет cv2/сегментации или ANALYZE_STUB=1 -> заглушка (фейковые числа, пустая маска);
+  - нет весов классификатора -> fallback вердикта: talc_pct>10% => talc, иначе ordinary.
+Разделение ordinary/hard_to_process делает ТОЛЬКО классификатор (никакой морфологии).
 """
 from __future__ import annotations
 
@@ -23,7 +34,6 @@ from typing import Optional, Union
 
 import config as C
 
-# Segmentation is the heavy import; guard it so the stub path works without cv2.
 try:
     import cv2
     import numpy as np
@@ -43,46 +53,40 @@ ImageInput = Union[str, Path, bytes, "np.ndarray"]
 
 
 # --------------------------------------------------------------------------- #
-# Verdict reconciliation (expert logic)
+# Вердикт (только классификатор; fallback без весов)
 # --------------------------------------------------------------------------- #
-def decide_verdict(metrics: dict, classifier_pred: Optional[dict]) -> tuple[str, str]:
-    """Return (verdict, source). Rule order:
-      1. talc% > threshold                         -> talc
-      2. else classifier verdict (if it disagrees with numbers on talc, defer to numbers)
-      3. else ordinary vs fine dominance from the segmentation
-    """
-    if metrics["talc_pct"] > C.TALC_VERDICT_THRESHOLD_PCT:
-        return C.CLASS_TALC, "talc_over_threshold"
-
-    dominance = C.CLASS_ORDINARY if metrics["ordinary_pct"] >= metrics["fine_pct"] else C.CLASS_HARD
-
+def decide_verdict(talc_pct: float, classifier_pred: Optional[dict]) -> tuple[str, Optional[float]]:
+    """Возвращает (verdict, confidence). Вердикт берём у классификатора as-is
+    (согласованность проверяем отдельно, не переопределяем). Без весов — грубый
+    fallback: талька много => talc, иначе ordinary-заглушка."""
     if classifier_pred is not None:
-        v = classifier_pred["verdict"]
-        # classifier says talc but segmentation talc is below threshold -> trust the numbers
-        if v == C.CLASS_TALC:
-            return dominance, "classifier_talc_low_defer_seg"
-        return v, "classifier"
+        probs = classifier_pred.get("probs") or {}
+        conf = max(probs.values()) if probs else None
+        return classifier_pred["verdict"], conf
+    if talc_pct > C.TALC_VERDICT_THRESHOLD_PCT:
+        return C.CLASS_TALC, None
+    return C.CLASS_ORDINARY, None
 
-    return dominance, "rule_based"
+
+def consistency_check(verdict: str, talc_pct: float) -> str:
+    """RU-строка: сходится ли вердикт классификатора с долей талька."""
+    thr = C.TALC_VERDICT_THRESHOLD_PCT
+    v_ru = C.CLASS_RU.get(verdict, verdict)
+    if verdict == C.CLASS_TALC:
+        if talc_pct >= thr:
+            return f"вердикт talc согласуется: талька {talc_pct}%"
+        return f"вердикт talc, но талька {talc_pct}% (<{thr:.0f}%) — проверить"
+    if talc_pct >= thr:
+        return f"вердикт {v_ru}, но талька {talc_pct}% (>{thr:.0f}%) — возможно talc, проверить"
+    return f"вердикт {v_ru} согласуется: талька {talc_pct}%"
 
 
 # --------------------------------------------------------------------------- #
-# Encoding helpers
+# Кодирование
 # --------------------------------------------------------------------------- #
-def _png_b64(bgr_or_bgra: "np.ndarray") -> str:
-    ok, buf = cv2.imencode(".png", bgr_or_bgra)
-    if not ok:
-        return ""
-    return base64.b64encode(buf.tobytes()).decode("ascii")
-
-
-def _mask_to_rgba_b64(color_mask_bgr: "np.ndarray") -> str:
-    """Color mask -> transparent-background RGBA PNG (alpha=0 where no phase), so the UI
-    can overlay it on the original at any opacity."""
-    alpha = (color_mask_bgr.any(axis=2).astype("uint8")) * 255
-    bgra = cv2.merge([color_mask_bgr[:, :, 0], color_mask_bgr[:, :, 1],
-                      color_mask_bgr[:, :, 2], alpha])
-    return _png_b64(bgra)
+def _png_b64(bgr: "np.ndarray") -> str:
+    ok, buf = cv2.imencode(".png", bgr)
+    return base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
 
 
 def _image_id(source: ImageInput, explicit: Optional[str]) -> str:
@@ -96,29 +100,30 @@ def _image_id(source: ImageInput, explicit: Optional[str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Stub (used when segmentation is unavailable or ANALYZE_STUB=1)
+# Заглушка
 # --------------------------------------------------------------------------- #
 def _stub_result(image_id: str, t0: float, reason: str) -> dict:
     log.info("stub result for %s (%s)", image_id, reason)
+    talc_pct = 4.0
+    verdict = C.CLASS_ORDINARY
     return {
         "image_id": image_id,
-        "verdict": C.CLASS_ORDINARY,
-        "metrics": {"sulfide_area_pct": 12.5, "ordinary_pct": 9.0,
-                    "fine_pct": 3.5, "talc_pct": 4.0},
-        "mask_png_b64": "",
-        "confidence_map_b64": "",
+        "verdict": verdict,
+        "talc_pct": talc_pct,
+        "talc_mask_png_b64": "",
+        "consistency_check": consistency_check(verdict, talc_pct),
+        "classifier_confidence": None,
         "processing_time_sec": round(time.time() - t0, 3),
         "verdict_source": f"stub:{reason}",
-        "classifier_probs": None,
     }
 
 
 # --------------------------------------------------------------------------- #
-# The contract
+# Контракт
 # --------------------------------------------------------------------------- #
 def analyze(image: ImageInput, image_id: Optional[str] = None,
             use_classifier: bool = True) -> dict:
-    """Analyse one слайд. See module docstring for the contract shape."""
+    """Анализ одного снимка. Форма ответа — см. докстрок модуля."""
     t0 = time.time()
     iid = _image_id(image, image_id)
 
@@ -128,52 +133,45 @@ def analyze(image: ImageInput, image_id: Optional[str] = None,
 
     try:
         seg = segment.analyze_image(image)
-    except Exception as e:  # never let the API 500 on a bad image — return a stub
+    except Exception as e:  # не роняем API на кривом снимке
         log.exception("segmentation failed for %s: %s", iid, e)
         return _stub_result(iid, t0, f"seg_error:{type(e).__name__}")
 
-    metrics = seg["metrics"]
+    talc_pct = seg["talc_pct"]
 
-    # Track 1: classifier verdict (optional; lazy import so torch stays optional).
+    # Трек 1: классификатор (опционально; torch импортим лениво)
     classifier_pred = None
     if use_classifier:
         try:
             from core import classifier
             classifier_pred = classifier.predict(seg["bgr"])
         except Exception as e:
-            log.info("classifier unavailable (%s) — using rule-based verdict", type(e).__name__)
+            log.info("classifier unavailable (%s) — fallback verdict", type(e).__name__)
 
-    verdict, source = decide_verdict(metrics, classifier_pred)
+    verdict, conf = decide_verdict(talc_pct, classifier_pred)
+    source = "classifier" if classifier_pred is not None else (
+        "fallback:talc>thr" if talc_pct > C.TALC_VERDICT_THRESHOLD_PCT else "fallback:default")
 
     result = {
         "image_id": iid,
         "verdict": verdict,
-        "metrics": metrics,
-        "mask_png_b64": _mask_to_rgba_b64(seg["color_mask"]),
-        "confidence_map_b64": "",   # TODO: expose classifier heatmap / seg certainty
+        "talc_pct": talc_pct,
+        "talc_mask_png_b64": _png_b64(seg["overlay"]),
+        "consistency_check": consistency_check(verdict, talc_pct),
+        "classifier_confidence": conf,
         "processing_time_sec": round(time.time() - t0, 3),
         "verdict_source": source,
-        "classifier_probs": classifier_pred["probs"] if classifier_pred else None,
     }
-    log.info("analyzed %s verdict=%s (%s) metrics=%s in %.2fs",
-             iid, verdict, source, metrics, result["processing_time_sec"])
+    log.info("analyzed %s verdict=%s (%s) talc=%.2f%% in %.2fs",
+             iid, verdict, source, talc_pct, result["processing_time_sec"])
     return result
-
-
-def overlay_png_b64(image: ImageInput) -> str:
-    """Convenience for the report/UI: full mask-over-image overlay as base64 PNG."""
-    if not _HAS_SEG:
-        return ""
-    seg = segment.analyze_image(image)
-    return _png_b64(seg["overlay"])
 
 
 if __name__ == "__main__":
     import json
     import sys
-    src = sys.argv[1] if len(sys.argv) > 1 else None
-    if src:
-        r = analyze(src)
-        r_print = {k: (v if k not in ("mask_png_b64", "confidence_map_b64")
-                       else f"<{len(v)} b64 chars>") for k, v in r.items()}
-        print(json.dumps(r_print, ensure_ascii=False, indent=2))
+    if len(sys.argv) > 1:
+        r = analyze(sys.argv[1])
+        r = {k: (f"<{len(v)} b64 chars>" if k == "talc_mask_png_b64" and v else v)
+             for k, v in r.items()}
+        print(json.dumps(r, ensure_ascii=False, indent=2))

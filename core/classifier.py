@@ -1,3 +1,12 @@
+# ============================================================
+# ВЛАДЕЛЕЦ: P2 (классификатор сорта + обучение)
+# TODO(P2):
+#   - обучить на DATA_DIR (GPU/L4 доступен), сохранить веса в CLASSIFIER_WEIGHTS;
+#   - довести macro-F1, приложить confusion matrix к отчёту;
+#   - следить за дисбалансом (talc ~171 vs ~565/486): class weights + oversampling;
+#   - сплит ТОЛЬКО по ID шлифа (GroupShuffleSplit) — иначе утечка и фальшивый F1.
+# Это ЕДИНСТВЕННЫЙ способ отличить ordinary/hard_to_process (морфологии срастаний нет).
+# ============================================================
 """
 Ore-sort classifier: transfer learning (EfficientNet-B0 / ResNet50, ImageNet weights).
 

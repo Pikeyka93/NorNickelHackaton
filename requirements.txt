@@ -1,31 +1,36 @@
+# ============================================================
+# ВЛАДЕЛЕЦ: P3 (зависимости + стабильность деплоя)
+# torch/torchvision зафиксированы под CUDA 12.1 (совместимо с драйвером 12.2 на L4).
+# Ставить с --no-cache-dir (диск ~5 ГБ): pip install --no-cache-dir -r requirements.txt
+# ============================================================
+
+# torch cu121 (Linux/сервер). Индекс PyTorch берётся первым для torch/torchvision.
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.3.1
+torchvision==0.18.1
+
 # Core numerics / imaging
 numpy>=1.24
 scipy>=1.10
-opencv-python-headless>=4.8      # headless: no GUI libs, works in Docker + Streamlit
+opencv-python-headless>=4.8      # headless: без GUI-libs, работает в Docker + Streamlit
 scikit-image>=0.21
 Pillow>=10.0
 
-# Classifier (transfer learning). On the L4 server install the CUDA 12.x build, e.g.:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-torch>=2.2
-torchvision>=0.17
 scikit-learn>=1.3               # GroupShuffleSplit, macro-F1, confusion matrix
 
 # API
 fastapi>=0.110
 uvicorn[standard]>=0.29
-python-multipart>=0.0.9         # file uploads
+python-multipart>=0.0.9         # загрузка файлов
 
 # UI
 streamlit>=1.33
 
-# Reporting / export
-reportlab>=4.0                  # PDF report
-pandas>=2.0                     # CSV export / metrics tables
+# Отчёты / экспорт
+reportlab>=4.0                  # PDF
+pandas>=2.0                     # CSV / таблицы
 
-# Utils
 tqdm>=4.66
 
-# Optional: SAM for blob boundaries (Apache-2.0). NOT installed by default.
-#   pip install segment-anything
-# NOTE: do NOT use ultralytics/YOLO (AGPL) — license incompatible with this project.
+# Опционально: SAM для границ (Apache-2.0), НЕ ставится по умолчанию: pip install segment-anything
+# НЕ использовать ultralytics/YOLO (AGPL).

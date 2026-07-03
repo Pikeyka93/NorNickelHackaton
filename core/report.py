@@ -1,9 +1,13 @@
+# ============================================================
+# ВЛАДЕЛЕЦ: P4 (отчёты CSV/PDF)
+# TODO(P4): при демо — проверить, что Cyrillic-шрифт есть на сервере
+#           (иначе PDF-текст «квадратами»); при желании добавить логотип/шапку.
+# ============================================================
 """
-Report generation: RU text verdict, CSV export, PDF report.
+Отчёты: RU текст-вердикт, CSV, PDF. Только тальк + сорт (по уточнениям жюри).
 
-PDF uses reportlab. Cyrillic needs a Unicode TTF — we try to register DejaVuSans from
-common locations (present on the Ubuntu server); if none is found we fall back to
-Helvetica and log a warning (PDF still generates, Cyrillic may render as boxes).
+PDF на reportlab. Для кириллицы нужен Unicode-TTF — пробуем зарегистрировать
+DejaVuSans (есть на сервере Ubuntu); иначе Helvetica (кириллица может не отрисоваться).
 """
 from __future__ import annotations
 
@@ -17,50 +21,37 @@ import config as C
 
 log = logging.getLogger("report")
 
-_CSV_FIELDS = ["image_id", "verdict", "sulfide_area_pct", "ordinary_pct",
-               "fine_pct", "talc_pct", "verdict_source", "processing_time_sec"]
+_CSV_FIELDS = ["image_id", "verdict", "talc_pct", "classifier_confidence",
+               "consistency_check", "processing_time_sec"]
 
-# Candidate Cyrillic-capable TTFs (server first, then mac).
 _FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/Library/Fonts/Arial Unicode.ttf",
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
 ]
 
 
 # --------------------------------------------------------------------------- #
-# Text verdict (RU)
+# Текст-вердикт (RU)
 # --------------------------------------------------------------------------- #
 def verdict_text(result: dict) -> str:
-    """One-line RU conclusion, e.g.:
-    'Руда классифицирована как оталькованная: тальк — 14.0%, преобладание тонких срастаний — 62%.'"""
-    m = result["metrics"]
+    """Краткое заключение, напр.:
+    'Руда классифицирована как оталькованная: тальк — 14.0%. вердикт talc согласуется: талька 14.0%'."""
     ru = C.CLASS_RU.get(result["verdict"], result["verdict"])
-    total_sulf = max(m["sulfide_area_pct"], 1e-6)
-    ord_share = round(100 * m["ordinary_pct"] / total_sulf)
-    fine_share = round(100 * m["fine_pct"] / total_sulf)
-    dominant = ("тонких срастаний", fine_share) if m["fine_pct"] > m["ordinary_pct"] \
-        else ("обычных срастаний", ord_share)
-    return (f"Руда классифицирована как {ru}: "
-            f"тальк — {m['talc_pct']}%, "
-            f"сульфиды — {m['sulfide_area_pct']}%, "
-            f"преобладание {dominant[0]} — {dominant[1]}%.")
+    return (f"Руда классифицирована как {ru}: тальк — {result['talc_pct']}%. "
+            f"{result.get('consistency_check', '')}").strip()
 
 
 # --------------------------------------------------------------------------- #
 # CSV
 # --------------------------------------------------------------------------- #
 def _row(result: dict) -> dict:
-    m = result["metrics"]
     return {
-        "image_id": result["image_id"],
-        "verdict": result["verdict"],
-        "sulfide_area_pct": m["sulfide_area_pct"],
-        "ordinary_pct": m["ordinary_pct"],
-        "fine_pct": m["fine_pct"],
-        "talc_pct": m["talc_pct"],
-        "verdict_source": result.get("verdict_source", ""),
+        "image_id": result.get("image_id", ""),
+        "verdict": result.get("verdict", ""),
+        "talc_pct": result.get("talc_pct", ""),
+        "classifier_confidence": result.get("classifier_confidence", ""),
+        "consistency_check": result.get("consistency_check", ""),
         "processing_time_sec": result.get("processing_time_sec", ""),
     }
 
@@ -87,14 +78,14 @@ def _register_font() -> str:
                 return "Cyr"
             except Exception:
                 continue
-    log.warning("No Cyrillic TTF found — PDF falls back to Helvetica (Cyrillic may not render).")
+    log.warning("Cyrillic TTF не найден — PDF на Helvetica (кириллица может не отрисоваться).")
     return "Helvetica"
 
 
 def build_pdf(result: dict, out_path: Optional[Path] = None,
               original_png: Optional[bytes] = None,
-              overlay_png: Optional[bytes] = None) -> Path:
-    """Render a one-page PDF: verdict, RU text, metrics table, original + mask overlay."""
+              talc_overlay_png: Optional[bytes] = None) -> Path:
+    """Одностраничный PDF: вердикт сорта, тальк %, согласованность, снимок + маска талька."""
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle
@@ -112,33 +103,38 @@ def build_pdf(result: dict, out_path: Optional[Path] = None,
     doc = SimpleDocTemplate(str(out_path), pagesize=A4,
                             leftMargin=1.5 * cm, rightMargin=1.5 * cm,
                             topMargin=1.5 * cm, bottomMargin=1.5 * cm)
+    ru = C.CLASS_RU.get(result["verdict"], result["verdict"])
+    conf = result.get("classifier_confidence")
+    conf_str = f"{conf:.2f}" if isinstance(conf, (int, float)) else "—"
     story = [
         Paragraph("Отчёт анализа аншлифа", h1),
         Paragraph(f"ID образца: {result['image_id']}", body),
         Spacer(1, 6),
+        Paragraph(f"Сорт руды (вердикт): <b>{ru}</b> (уверенность: {conf_str})", body),
         Paragraph(verdict_text(result), body),
         Spacer(1, 10),
     ]
 
-    m = result["metrics"]
     data = [
-        ["Метрика", "Значение, %"],
-        ["Доля сульфидов", m["sulfide_area_pct"]],
-        ["Обычные срастания (зелёный)", m["ordinary_pct"]],
-        ["Тонкие срастания (красный)", m["fine_pct"]],
-        ["Тальк (синий)", m["talc_pct"]],
+        ["Метрика", "Значение"],
+        ["Сорт руды", ru],
+        ["Доля талька, %", result["talc_pct"]],
+        ["Согласованность", result.get("consistency_check", "")],
     ]
-    table = Table(data, colWidths=[9 * cm, 5 * cm])
+    table = Table(data, colWidths=[6 * cm, 9 * cm])
     table.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), font),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2b3a55")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f0f2f6")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]))
     story += [table, Spacer(1, 14)]
 
-    for caption, png in (("Исходное изображение", original_png), ("Маска фаз", overlay_png)):
+    for caption, png in (("Исходное изображение", original_png),
+                         ("Маска талька (синий)", talc_overlay_png)):
         if png:
             story.append(Paragraph(caption, body))
             story.append(RLImage(io.BytesIO(png), width=15 * cm, height=11 * cm, kind="proportional"))
