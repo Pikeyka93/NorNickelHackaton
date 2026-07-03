@@ -111,6 +111,35 @@ def _local_variance(gray_f: np.ndarray, win: int) -> np.ndarray:
     return var / (255.0 ** 2)
 
 
+def _vignette_mask(gray: np.ndarray) -> np.ndarray:
+    """Маска чёрной рамки/виньетки апертуры, а НЕ талька.
+
+    Отражённая оптическая микроскопия часто даёт круглое поле зрения с чёрными
+    углами кадра (виньетка объектива); скриншоты/кропы иногда добавляют чёрные
+    полосы у края. И то и другое — тёмное+гладкое+касается края кадра, то есть
+    формально проходит все признаки талька из detect_talc(). Без явного исключения
+    оно ошибочно посчиталось бы тальком и раздуло бы talc_pct. Здесь берём крупные
+    тёмные связные области, касающиеся границы кадра, и трактуем их как "вне
+    образца" (calibrate_talc.py сможет откалибровать TALC_VIGNETTE_* по факту)."""
+    h, w = gray.shape
+    dark = (gray < C.TALC_VIGNETTE_ABS_THR).astype(np.uint8)
+    n, labels = cv2.connectedComponents(dark, 8)
+    if n <= 1:
+        return np.zeros((h, w), bool)
+    border_labels = set(np.unique(labels[0, :])) | set(np.unique(labels[-1, :]))
+    border_labels |= set(np.unique(labels[:, 0])) | set(np.unique(labels[:, -1]))
+    border_labels.discard(0)
+    if not border_labels:
+        return np.zeros((h, w), bool)
+    min_area = C.TALC_VIGNETTE_MIN_AREA_FRAC * h * w
+    mask = np.zeros((h, w), bool)
+    for lbl in border_labels:
+        comp = labels == lbl
+        if comp.sum() >= min_area:
+            mask |= comp
+    return mask
+
+
 def detect_talc(norm_bgr: np.ndarray) -> np.ndarray:
     """Бинарная маска талька (0/255).
 
@@ -118,13 +147,16 @@ def detect_talc(norm_bgr: np.ndarray) -> np.ndarray:
     темнее фона: либо (b) по абсолюту (темнее уровня матрицы на TALC_ABS_MARGIN —
     ловит ИНТЕРЬЕР больших зон, т.к. после нормализации фон почти ровный), либо
     (c) темнее локального фона на TALC_LOCAL_MARGIN (края / остаточный градиент).
-    На равномерном фоне без талька результат ~пустой (не раздуваем долю). Калибровать
-    по синим обводкам."""
+    Чёрная рамка/виньетка апертуры исключается отдельно (см. _vignette_mask) —
+    иначе она проходит все признаки талька и раздувает долю. На равномерном фоне
+    без талька результат ~пустой (не раздуваем долю). Калибровать по синим обводкам."""
     gray = cv2.cvtColor(norm_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
     win = C.TALC_LOCAL_WINDOW | 1
 
+    vignette = _vignette_mask(gray)                  # рамка/виньетка — не образец
+
     bright_cut = np.percentile(gray, C.TALC_BRIGHT_EXCLUDE_PERCENTILE)
-    matrix = gray < bright_cut                      # (a) нерудная матрица
+    matrix = (gray < bright_cut) & ~vignette          # (a) нерудная матрица, без рамки
     if matrix.sum() < 10:
         return np.zeros(gray.shape, np.uint8)
 
@@ -145,7 +177,7 @@ def detect_talc(norm_bgr: np.ndarray) -> np.ndarray:
     bg_local = gsum / (gcnt + 1e-6)
     contrast_ok = (gcnt > 0) & (gray < bg_local - C.TALC_CONTRAST_MARGIN)
 
-    talc = (cand & contrast_ok).astype(np.uint8) * 255
+    talc = (cand & contrast_ok & ~vignette).astype(np.uint8) * 255
     talc = cv2.morphologyEx(talc, cv2.MORPH_OPEN, _K5)
     talc = cv2.morphologyEx(talc, cv2.MORPH_CLOSE, _K5)
     return _drop_small(talc, C.TALC_MIN_BLOB_AREA)
