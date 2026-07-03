@@ -1,18 +1,21 @@
 # ============================================================
 # ВЛАДЕЛЕЦ: P1 (сегментация талька)
-# TODO(P1): прогнать на сервере против DATA_DIR (там снимки с синими обводками),
-#           применить лучшие параметры (--apply) в config.py.
-#           Цель из брифа: mean abs talc_pct error <= 3%.
+# TODO(P1): прогнать на сервере против DATA_DIR, применить лучшие параметры
+#           (--apply) в config.py. Цель из брифа: mean abs talc_pct error <= 3%.
 # ============================================================
 """
-Калибровка порогов TALC_* (config.py) по синим экспертным обводкам.
+Калибровка порогов TALC_* (config.py) по экспертной разметке талька.
 
-Единственная пиксельная разметка в датасете — синие контуры талька, нарисованные
-экспертом поверх части оталькованных снимков. Скрипт:
+Разметка в датасете — не синие линии поверх самого снимка, а ОТДЕЛЬНАЯ подпапка
+рядом с оригиналами (по факту: `<класс>/Области оталькования/<то же имя файла>`,
+см. debug-скрипт коллеги). Внутри неё файл может быть либо копией снимка с синим
+контуром талька, либо готовой маской — детектируем автоматически по количеству
+синих пикселей (`core.segment.extract_blue_annotations`). Скрипт:
 
-  1. находит снимки с заметными синими обводками под --data-dir
-     (`core.segment.extract_blue_annotations`);
-  2. для каждого считает эталон: маску талька и её долю (%) от площади снимка;
+  1. находит пары (оригинал, эталон) — по подпапкам, чьё имя похоже на
+     "Области оталькования" (гибко, т.к. ч1/ч2 могут называть по-разному), плюс
+     резервный вариант: синие обводки прямо на самом оригинале;
+  2. для каждой пары считает эталонную маску/долю талька;
   3. случайным поиском + локальным уточнением подбирает TALC_* так, чтобы
      `detect_talc()` был ближе всего к эталону (главный критерий — |Δ talc_pct|,
      цель <=3%; IoU — вторичный сигнал, обводки размечают не каждое пятнышко талька);
@@ -41,12 +44,19 @@ from typing import Optional
 # make repo root importable regardless of cwd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 import config as C  # noqa: E402
 from core import segment  # noqa: E402
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+
+# Ключевые слова в имени подпапки, которая содержит экспертную разметку талька
+# рядом с оригиналами (по факту в датасете: "Области оталькования"). Гибко на
+# случай, если ч1/ч2 называют её чуть иначе.
+EXPERT_SUBDIR_KEYWORDS = ("облас", "тальк", "оталь")
+MIN_BLUE_PIXELS = 200  # порог "заметных" синих пикселей, иначе считаем шумом
 
 # Параметры, которые крутим, и диапазоны поиска (см. TODO(P1) в config.py).
 PARAM_SPACE: dict[str, tuple[float, float]] = {
@@ -63,41 +73,105 @@ INT_PARAMS = {"TALC_BRIGHT_EXCLUDE_PERCENTILE", "TALC_DARK_PERCENTILE", "TALC_MI
 
 @dataclass
 class CalibSample:
-    path: Path
+    orig_path: Path
+    expert_path: Path
     bgr: "np.ndarray"
     gt_mask: "np.ndarray"
     gt_pct: float
+    gt_kind: str  # "blue_outline" | "direct_mask" — для отчёта/отладки
 
 
 # --------------------------------------------------------------------------- #
 # Данные
 # --------------------------------------------------------------------------- #
-def find_annotated_images(data_dir: Path, limit: Optional[int] = None) -> list[Path]:
-    """Найти снимки с заметными синими обводками (кандидаты для калибровки)."""
-    found: list[Path] = []
-    for p in sorted(data_dir.rglob("*")):
-        if not p.is_file() or p.suffix.lower() not in IMG_EXTS:
-            continue
-        try:
-            bgr = segment.read_image_bgr(p)
-        except Exception:
-            continue
-        blue = segment.extract_blue_annotations(bgr, fill=False)
-        if int((blue > 0).sum()) < 200:  # шум / случайные синие пиксели отсекаем
-            continue
-        found.append(p)
-        if limit and len(found) >= limit:
-            break
-    return found
+def _is_expert_subdir(name: str) -> bool:
+    key = name.strip().lower()
+    return any(kw in key for kw in EXPERT_SUBDIR_KEYWORDS)
 
 
-def load_calib_set(paths: list[Path]) -> list[CalibSample]:
+def find_annotated_pairs(data_dir: Path, limit: Optional[int] = None) -> list[tuple[Path, Path]]:
+    """Найти пары (оригинал, файл-эталон талька).
+
+    Основной путь: подпапки вида `<класс>/Области оталькования/<то же имя>` —
+    именно так устроена разметка в датасете (см. debug-скрипт коллеги: EXPERT_DIR
+    = ORIG_DIR / "Области оталькования"). Резервный путь (на случай другого
+    расположения в ч2 или ручных тестов): синие обводки прямо на самом снимке.
+    """
+    pairs: list[tuple[Path, Path]] = []
+    seen_orig: set[Path] = set()
+
+    # --- путь 1: сиблинг-подпапка с эталонами ---
+    for expert_dir in sorted(data_dir.rglob("*")):
+        if not expert_dir.is_dir() or not _is_expert_subdir(expert_dir.name):
+            continue
+        orig_dir = expert_dir.parent
+        for expert_path in sorted(expert_dir.iterdir()):
+            if not expert_path.is_file() or expert_path.suffix.lower() not in IMG_EXTS:
+                continue
+            orig_path = orig_dir / expert_path.name
+            if orig_path.exists() and orig_path not in seen_orig:
+                pairs.append((orig_path, expert_path))
+                seen_orig.add(orig_path)
+                if limit and len(pairs) >= limit:
+                    return pairs
+
+    # --- путь 2 (резерв): синие обводки прямо на оригинале ---
+    if not limit or len(pairs) < limit:
+        for p in sorted(data_dir.rglob("*")):
+            if not p.is_file() or p.suffix.lower() not in IMG_EXTS or p in seen_orig:
+                continue
+            if any(_is_expert_subdir(parent.name) for parent in p.parents):
+                continue  # сами файлы внутри эталонных подпапок пропускаем
+            try:
+                bgr = segment.read_image_bgr(p)
+            except Exception:
+                continue
+            blue = segment.extract_blue_annotations(bgr, fill=False)
+            if int((blue > 0).sum()) < MIN_BLUE_PIXELS:
+                continue
+            pairs.append((p, p))  # эталон и оригинал — один и тот же файл
+            seen_orig.add(p)
+            if limit and len(pairs) >= limit:
+                break
+
+    return pairs
+
+
+def _ground_truth_from_expert(expert_bgr: "np.ndarray") -> tuple["np.ndarray", str]:
+    """Эталонная маска талька из файла-эталона + пометка, как она получена.
+
+    Файл-эталон бывает либо копией снимка с синим контуром талька (тогда достаём
+    `extract_blue_annotations`), либо уже готовой маской (бинарной/почти бинарной
+    заливкой) — тогда просто бинаризуем. Определяем по количеству синих пикселей."""
+    blue = segment.extract_blue_annotations(expert_bgr, fill=False)
+    if int((blue > 0).sum()) >= MIN_BLUE_PIXELS:
+        return segment.extract_blue_annotations(expert_bgr, fill=True), "blue_outline"
+
+    gray = cv2.cvtColor(expert_bgr, cv2.COLOR_BGR2GRAY)
+    # Готовая маска обычно почти бинарна (мало уникальных значений) — Otsu ок в обоих случаях.
+    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Если после Otsu "тальком" оказалось больше половины кадра — скорее всего инверсия
+    # (маска нарисована в 0=тальк) или это не маска вовсе; берём меньшую по площади сторону.
+    if (mask > 0).mean() > 0.5:
+        mask = 255 - mask
+    return mask, "direct_mask"
+
+
+def load_calib_set(pairs: list[tuple[Path, Path]]) -> list[CalibSample]:
     samples = []
-    for p in paths:
-        bgr = segment.read_image_bgr(p)
-        gt = segment.extract_blue_annotations(bgr, fill=True)
-        samples.append(CalibSample(path=p, bgr=bgr, gt_mask=gt,
-                                    gt_pct=segment.talc_percentage(gt)))
+    for orig_path, expert_path in pairs:
+        try:
+            bgr = segment.read_image_bgr(orig_path)
+            expert_bgr = (bgr if expert_path == orig_path
+                          else segment.read_image_bgr(expert_path))
+        except Exception as e:
+            print(f"  [!] пропускаю {orig_path.name}: {e}")
+            continue
+        gt, kind = _ground_truth_from_expert(expert_bgr)
+        if gt.shape[:2] != bgr.shape[:2]:
+            gt = cv2.resize(gt, (bgr.shape[1], bgr.shape[0]), interpolation=cv2.INTER_NEAREST)
+        samples.append(CalibSample(orig_path=orig_path, expert_path=expert_path, bgr=bgr,
+                                    gt_mask=gt, gt_pct=segment.talc_percentage(gt), gt_kind=kind))
     return samples
 
 
@@ -179,10 +253,10 @@ def _apply_to_config_file(params: dict) -> None:
 # CLI
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Калибровка TALC_* по синим экспертным обводкам")
+    ap = argparse.ArgumentParser(description="Калибровка TALC_* по экспертной разметке талька")
     ap.add_argument("--data-dir", default=str(C.DATA_DIR))
     ap.add_argument("--max-images", type=int, default=60,
-                    help="сколько размеченных (с синими обводками) снимков использовать")
+                    help="сколько размеченных пар (оригинал+эталон) использовать")
     ap.add_argument("--trials", type=int, default=200, help="случайных комбинаций перебрать")
     ap.add_argument("--refine-steps", type=int, default=60)
     ap.add_argument("--seed", type=int, default=C.RANDOM_SEED)
@@ -192,14 +266,21 @@ def main() -> None:
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
-    print(f"[calibrate_talc] ищу снимки с синими обводками в {data_dir} ...")
-    paths = find_annotated_images(data_dir, limit=args.max_images)
-    if not paths:
-        print("[calibrate_talc] не нашёл ни одного снимка с синими обводками — "
-              "проверь --data-dir и BLUE_HSV_LOWER/UPPER в config.py.")
+    print(f"[calibrate_talc] ищу пары (оригинал, эталон талька) в {data_dir} ...")
+    pairs = find_annotated_pairs(data_dir, limit=args.max_images)
+    if not pairs:
+        print("[calibrate_talc] не нашёл ни одной размеченной пары — проверь --data-dir, "
+              f"имя подпапки с эталонами (ищу по ключевым словам {EXPERT_SUBDIR_KEYWORDS}) "
+              "и BLUE_HSV_LOWER/UPPER в config.py.")
         sys.exit(1)
-    print(f"[calibrate_talc] калибровочный набор: {len(paths)} снимков")
-    samples = load_calib_set(paths)
+    print(f"[calibrate_talc] калибровочный набор: {len(pairs)} пар")
+    samples = load_calib_set(pairs)
+    if not samples:
+        print("[calibrate_talc] пары нашлись, но ни одна не прочиталась — см. сообщения выше.")
+        sys.exit(1)
+    n_blue = sum(1 for s in samples if s.gt_kind == "blue_outline")
+    n_mask = sum(1 for s in samples if s.gt_kind == "direct_mask")
+    print(f"[calibrate_talc] эталон: {n_blue} через синие обводки, {n_mask} как готовая маска")
 
     baseline_params = {k: getattr(C, k) for k in PARAM_SPACE}
     baseline_metrics = evaluate(baseline_params, samples)
