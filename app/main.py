@@ -64,6 +64,41 @@ html, body, [class*="css"] { font-family: 'Manrope', -apple-system, sans-serif !
 #MainMenu, footer, div[data-testid="stToolbar"] { visibility: hidden; height: 0; }
 .block-container { padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1220px; }
 
+/* фон вместо плоского белого/серого — мягкие цветные пятна на светлой подложке */
+[data-testid="stAppViewContainer"], .stApp {
+    background:
+        radial-gradient(circle at 10% -6%, rgba(22,86,201,.13), transparent 34%),
+        radial-gradient(circle at 92% 8%, rgba(23,40,77,.10), transparent 30%),
+        radial-gradient(circle at 78% 92%, rgba(22,86,201,.09), transparent 34%),
+        radial-gradient(circle at 4% 88%, rgba(90,180,190,.10), transparent 32%),
+        linear-gradient(180deg, #f2f5fb 0%, #eef2f9 100%);
+    background-attachment: fixed;
+}
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #ffffff 0%, #f8f9fd 100%);
+    box-shadow: 2px 0 16px rgba(23,40,77,.05);
+}
+
+/* --- зона загрузки файлов --- */
+.snb-upload-label {
+    display:flex; align-items:center; gap:.5rem; font-weight:700; color: var(--nn-navy);
+    margin-bottom: .5rem; font-size: .98rem;
+}
+[data-testid="stFileUploaderDropzone"] {
+    background: linear-gradient(135deg, #eef4ff 0%, #f8fafe 100%) !important;
+    border: 1.5px dashed #a9c3ef !important;
+    border-radius: 16px !important;
+    transition: border-color .18s ease, background .18s ease;
+}
+[data-testid="stFileUploaderDropzone"]:hover {
+    border-color: var(--nn-blue) !important;
+    background: linear-gradient(135deg, #e2ecff 0%, #f4f8ff 100%) !important;
+}
+[data-testid="stFileUploaderDropzoneInstructions"] svg { fill: var(--nn-blue) !important; }
+[data-testid="stFileUploader"] section button {
+    border-radius: 10px !important;
+}
+
 /* --- topbar --- */
 .snb-topbar { display:flex; align-items:center; gap:.6rem; margin-bottom: .9rem; }
 .snb-topbar .logo {
@@ -318,10 +353,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+st.markdown(
+    '<div class="snb-upload-label">\U0001F4E4 Загрузите снимок(и) аншлифа / '
+    'панораму (TIFF / PNG / JPEG)</div>',
+    unsafe_allow_html=True,
+)
 files = st.file_uploader(
     "Загрузите снимок(и) аншлифа / панораму (TIFF / PNG / JPEG)",
     type=["tif", "tiff", "png", "jpg", "jpeg", "bmp"],
     accept_multiple_files=True,
+    label_visibility="collapsed",
 )
 
 if not files:
