@@ -16,8 +16,8 @@
 | Раздел | Файл | Владелец | Что сделать | Статус |
 |---|---|---|---|---|
 | Сегментация талька | `core/segment.py` | P1 | нормализация + детектор талька (тёмная гладкая фаза, темнее локального фона), маска, `talc_pct`, тайлинг | ✅ каркас готов |
-| Калибровка талька | `core/segment.py`, `config.py`, `notebooks/` | P1 | подобрать `TALC_*` по синим обводкам (`extract_blue_annotations`), цель ошибка `talc_pct` ±3% | ⬜ TODO |
-| Тайлинг панорам | `core/segment.py` | P1 | проверить бюджет ≤5 мин на реальной панораме; при нужде — ленивый тайлинг (pyvips/tifffile) | ⬜ TODO |
+| Калибровка талька | `scripts/calibrate_talc.py`, `config.py` | P1 | инструмент готов (поиск по синим обводкам + подбор `TALC_*`, `--apply` пишет в `config.py`); **прогнать на сервере** на `DATA_DIR`, цель ошибка `talc_pct` ±3% | 🔧 инструмент готов, калибровка на данных — TODO |
+| Тайлинг панорам | `scripts/benchmark_tiling.py`, `core/segment.py` | P1 | инструмент готов (время/память/бюджет 5 мин); **прогнать на реальной панораме**; если бюджет не влезает — ленивый тайлинг (pyvips/tifffile) | 🔧 инструмент готов, прогон на панораме — TODO |
 | Классификатор | `core/classifier.py` | P2 | 3 класса, EfficientNet-B0/ResNet50, сплит по ID шлифа, grayscale+colorjitter, class weights + oversampling | ✅ код готов |
 | Обучение | `scripts/train.py` | P2 | обучить на `DATA_DIR`, сохранить веса, macro-F1 + confusion matrix | ⬜ TODO |
 | Маппинг папок | `core/labels.py` | P2 | сверить имена папок ч1/ч2 (`python -m core.labels`) | ⬜ проверить |
@@ -34,6 +34,9 @@
 export DATA_DIR="$HOME/dataset/Задача 3. Скажи мне, кто твой шлиф"
 python -m core.labels                      # проверить маппинг папок
 python scripts/train.py --epochs 15        # P2: обучение (нужен GPU)
+python scripts/calibrate_talc.py --trials 300     # P1: калибровка TALC_* по синим обводкам
+python scripts/calibrate_talc.py --apply          # P1: записать лучшие TALC_* в config.py
+python scripts/benchmark_tiling.py "$DATA_DIR/Панорамы/<файл>"   # P1: бюджет тайлинга (≤5 мин)
 uvicorn api.main:app --host 0.0.0.0 --port 8000   # P3: API
 streamlit run app/main.py                  # P4: UI (живой деплой)
 ```
