@@ -1,43 +1,60 @@
-# Notebooks — эксперименты и калибровка
+# Notebooks — эксперименты, калибровка и отчёт P4
 
-Пространство для калибровки порогов. Держите здесь только `.ipynb`/`.md`,
-данные и веса не коммитьте (см. `.gitignore`).
+В этой папке лежат только `.ipynb`/`.md`. Данные, веса, отчёты и большие картинки
+не коммитятся.
 
-## Приоритетная задача: калибровка детектора талька по СИНИМ обводкам
+## P4 interface report
+
+`P4_interface_report.ipynb` — сдачный ноутбук по интерфейсу:
+
+- что именно сделано в `app/main.py`;
+- как UI связан с `core.analyze()`;
+- какие поля показываются геологу;
+- какие файлы скачиваются из интерфейса;
+- как запустить локально и в режиме заглушки.
+
+## Калибровка детектора талька по синим обводкам
 
 Единственная пиксельная разметка в датасете — синие контуры, нарисованные экспертом
-поверх части оталькованных снимков. Используйте их как ground truth:
+поверх части оталькованных снимков. Их используем как ground truth для талька.
 
 ```python
 import cv2
 from core import segment
-import config as C
 
 bgr = segment.read_image_bgr("<оталькованный снимок с синей обводкой>")
-gt_talc = segment.extract_blue_annotations(bgr, fill=True)   # эталон талька (маска)
+gt_talc = segment.extract_blue_annotations(bgr, fill=True)
+pred = segment.analyze_image(bgr)
+pred_talc = pred["talc_mask"]
 
-norm = segment.normalize_illumination(bgr)
-sulf = segment.segment_sulfides(norm)
-pred_talc = segment.detect_talc(norm, sulf)
-
-# IoU / расхождение доли талька -> подбор порогов в config.py
 inter = (gt_talc > 0) & (pred_talc > 0)
 union = (gt_talc > 0) | (pred_talc > 0)
 iou = inter.sum() / max(union.sum(), 1)
 err_pct = abs((pred_talc > 0).mean() - (gt_talc > 0).mean()) * 100
-print("IoU", iou, "talc err %", err_pct)   # цель по доле талька: <= ±3%
+
+print("IoU:", round(iou, 3))
+print("talc err %:", round(err_pct, 2))
+print("pred talc %:", pred["talc_pct"])
 ```
 
-Крутите в `config.py`: `TALC_DARK_PERCENTILE`, `TALC_LOCAL_WINDOW`,
-`TALC_MAX_TEXTURE`, `TALC_MIN_BLOB_AREA`, а также `BLUE_HSV_LOWER/UPPER`
-(если синий обводки плохо ловятся).
+Цель для P1: ошибка доли талька около `±3%` на размеченных снимках.
 
-## Калибровка обычные vs тонкие срастания
+Калибровать в `config.py`:
 
-Соберите несколько эталонных «рядовых» и «труднообогатимых» кропов, посмотрите
-распределения `solidity` / `compactness` / `area` по блобам (`classify_intergrowths`),
-подберите `INTERGROWTH_*` в `config.py`.
+- `TALC_DARK_PERCENTILE`
+- `TALC_ABS_MARGIN`
+- `TALC_LOCAL_WINDOW`
+- `TALC_LOCAL_MARGIN`
+- `TALC_MAX_TEXTURE`
+- `TALC_MIN_BLOB_AREA`
+- `TALC_BG_WINDOW`
+- `TALC_CONTRAST_MARGIN`
+- `BLUE_HSV_LOWER / BLUE_HSV_UPPER`, если экспертный синий плохо извлекается.
 
-## Порог сульфидов
+## Проверка панорам
 
-Если Otsu недооценивает/переоценивает — правьте `SULFIDE_OTSU_OFFSET`.
+Панорама — рабочий вход инференса. После калибровки P1 нужно отдельно замерить:
+
+- время обработки одной панорамы;
+- корректность тайлинга без швов на маске;
+- устойчивость `talc_pct` после даунскейла `MAX_PROCESS_SIDE`.
