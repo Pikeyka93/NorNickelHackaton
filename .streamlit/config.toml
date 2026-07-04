@@ -1,0 +1,18 @@
+# ============================================================
+# ВЛАДЕЛЕЦ: P4 (UI) — тема оформления + скрытие дефолтного тулбара Streamlit.
+# Правки предложены P1 (Timur) вместе с редизайном app/main.py.
+# ============================================================
+[theme]
+base = "light"
+primaryColor = "#1656c9"
+backgroundColor = "#f3f5fa"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#17284d"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+showSidebarNavigation = true
+
+[browser]
+gatherUsageStats = false

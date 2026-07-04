@@ -111,6 +111,55 @@ def _local_variance(gray_f: np.ndarray, win: int) -> np.ndarray:
     return var / (255.0 ** 2)
 
 
+def _local_coherence(gray_f: np.ndarray, win: int) -> np.ndarray:
+    """Когерентность локальной структуры (0..1) через тензор структуры (Sobel).
+
+    0 = изотропно (нет выраженного направления градиента, как у рассеянного
+    гладкого талька), 1 = сильно направленно (как у игольчатых/призматических
+    зёрен сульфидов — они тёмные и гладкие ВНУТРИ зерна, поэтому проходят все
+    остальные признаки талька, но имеют выраженную ось вытянутости, которой у
+    талька нет). Используется как дополнительный фильтр ложных срабатываний на
+    рядовых рудах с игольчатой текстурой (см. calibrate_talc.py / TALC_MAX_COHERENCE)."""
+    gx = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)
+    gxx = cv2.boxFilter(gx * gx, -1, (win, win))
+    gyy = cv2.boxFilter(gy * gy, -1, (win, win))
+    gxy = cv2.boxFilter(gx * gy, -1, (win, win))
+    tmp = np.sqrt(np.clip((gxx - gyy) ** 2 + 4 * gxy ** 2, 0, None))
+    l1 = (gxx + gyy + tmp) / 2
+    l2 = (gxx + gyy - tmp) / 2
+    return (l1 - l2) / (l1 + l2 + 1e-6)
+
+
+def _vignette_mask(gray: np.ndarray) -> np.ndarray:
+    """Маска чёрной рамки/виньетки апертуры, а НЕ талька.
+
+    Отражённая оптическая микроскопия часто даёт круглое поле зрения с чёрными
+    углами кадра (виньетка объектива); скриншоты/кропы иногда добавляют чёрные
+    полосы у края. И то и другое — тёмное+гладкое+касается края кадра, то есть
+    формально проходит все признаки талька из detect_talc(). Без явного исключения
+    оно ошибочно посчиталось бы тальком и раздуло бы talc_pct. Здесь берём крупные
+    тёмные связные области, касающиеся границы кадра, и трактуем их как "вне
+    образца" (calibrate_talc.py сможет откалибровать TALC_VIGNETTE_* по факту)."""
+    h, w = gray.shape
+    dark = (gray < C.TALC_VIGNETTE_ABS_THR).astype(np.uint8)
+    n, labels = cv2.connectedComponents(dark, 8)
+    if n <= 1:
+        return np.zeros((h, w), bool)
+    border_labels = set(np.unique(labels[0, :])) | set(np.unique(labels[-1, :]))
+    border_labels |= set(np.unique(labels[:, 0])) | set(np.unique(labels[:, -1]))
+    border_labels.discard(0)
+    if not border_labels:
+        return np.zeros((h, w), bool)
+    min_area = C.TALC_VIGNETTE_MIN_AREA_FRAC * h * w
+    mask = np.zeros((h, w), bool)
+    for lbl in border_labels:
+        comp = labels == lbl
+        if comp.sum() >= min_area:
+            mask |= comp
+    return mask
+
+
 def detect_talc(norm_bgr: np.ndarray) -> np.ndarray:
     """Бинарная маска талька (0/255).
 
@@ -118,13 +167,16 @@ def detect_talc(norm_bgr: np.ndarray) -> np.ndarray:
     темнее фона: либо (b) по абсолюту (темнее уровня матрицы на TALC_ABS_MARGIN —
     ловит ИНТЕРЬЕР больших зон, т.к. после нормализации фон почти ровный), либо
     (c) темнее локального фона на TALC_LOCAL_MARGIN (края / остаточный градиент).
-    На равномерном фоне без талька результат ~пустой (не раздуваем долю). Калибровать
-    по синим обводкам."""
+    Чёрная рамка/виньетка апертуры исключается отдельно (см. _vignette_mask) —
+    иначе она проходит все признаки талька и раздувает долю. На равномерном фоне
+    без талька результат ~пустой (не раздуваем долю). Калибровать по синим обводкам."""
     gray = cv2.cvtColor(norm_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
     win = C.TALC_LOCAL_WINDOW | 1
 
+    vignette = _vignette_mask(gray)                  # рамка/виньетка — не образец
+
     bright_cut = np.percentile(gray, C.TALC_BRIGHT_EXCLUDE_PERCENTILE)
-    matrix = gray < bright_cut                      # (a) нерудная матрица
+    matrix = (gray < bright_cut) & ~vignette          # (a) нерудная матрица, без рамки
     if matrix.sum() < 10:
         return np.zeros(gray.shape, np.uint8)
 
@@ -134,6 +186,13 @@ def detect_talc(norm_bgr: np.ndarray) -> np.ndarray:
     dark_local = gray < (local_mean - C.TALC_LOCAL_MARGIN)      # (c) темнее локального фона
     smooth = _local_variance(gray, win) < C.TALC_MAX_TEXTURE    # (d) гладкий
     cand = matrix & smooth & (dark_abs | dark_local)
+
+    # (d2) изотропность: тальк рассеян и не имеет выраженной оси, а игольчатые
+    # сульфиды — тёмные+гладкие ВНУТРИ зерна, но вытянутые -> высокая когерентность.
+    # Без этого фильтра плотные скопления игольчатых зёрен на рядовой руде ошибочно
+    # ловятся как тальк (см. коммит с "needle-grain false positive").
+    isotropic = _local_coherence(gray, win) < C.TALC_MAX_COHERENCE
+    cand = cand & isotropic
 
     # (e) регион-контраст: оценить фон по ОКРУЖАЮЩЕМУ гангу (исключая тёмные кандидаты)
     # и оставить только пиксели, что темнее этого фона -> отсекает плавные тёмные
@@ -145,9 +204,19 @@ def detect_talc(norm_bgr: np.ndarray) -> np.ndarray:
     bg_local = gsum / (gcnt + 1e-6)
     contrast_ok = (gcnt > 0) & (gray < bg_local - C.TALC_CONTRAST_MARGIN)
 
-    talc = (cand & contrast_ok).astype(np.uint8) * 255
+    talc = (cand & contrast_ok & ~vignette).astype(np.uint8) * 255
     talc = cv2.morphologyEx(talc, cv2.MORPH_OPEN, _K5)
-    talc = cv2.morphologyEx(talc, cv2.MORPH_CLOSE, _K5)
+    # Укрупнение формы: реальный тальк — большие сплошные пятна (см. эталонные
+    # обводки), а не пиксельная рябь. Раньше closing был фиксирован на 5px, из-за
+    # чего кандидаты (даже верные, внутри настоящих тальк-зон) оставались
+    # рассыпанными точками -> IoU с эталоном был ~0.05-0.07 при формально похожем
+    # проценте площади (ложный шум в других местах кадра компенсировал недобор
+    # внутри реальных зон). TALC_MORPH_CLOSE_KERNEL мержит соседние кандидаты в
+    # сплошные пятна; TALC_MIN_BLOB_AREA после этого отсекает то, что не срослось
+    # в пятно нужного масштаба (шум), а не мелкие внутренние вкрапления талька.
+    close_k = C.TALC_MORPH_CLOSE_KERNEL | 1
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+    talc = cv2.morphologyEx(talc, cv2.MORPH_CLOSE, close_kernel)
     return _drop_small(talc, C.TALC_MIN_BLOB_AREA)
 
 
@@ -200,12 +269,20 @@ def segment_talc(bgr: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 def build_talc_overlay(bgr: np.ndarray, talc_mask: np.ndarray,
                        alpha: float = C.MASK_ALPHA) -> np.ndarray:
-    """Синяя полупрозрачная маска талька поверх снимка (BGR)."""
+    """Синяя полупрозрачная маска талька поверх снимка (BGR) + тонкий контур по
+    границе для чёткости края (сплошная заливка — по явной просьбе, а не только
+    обводка линией)."""
     out = bgr.copy()
     blue = np.zeros_like(bgr)
     blue[:] = C.COLOR_TALC
     m = talc_mask > 0
     out[m] = cv2.addWeighted(bgr, 1 - alpha, blue, alpha, 0)[m]
+
+    # тонкий контур поверх заливки — чуть чётче читается граница зоны на глаз
+    contours, _ = cv2.findContours((talc_mask > 0).astype(np.uint8),
+                                    cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    thickness = max(1, round(0.001 * max(bgr.shape[:2])))
+    cv2.drawContours(out, contours, -1, C.COLOR_TALC, thickness, lineType=cv2.LINE_AA)
     return out
 
 

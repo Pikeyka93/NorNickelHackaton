@@ -1,3 +1,12 @@
+# Project artifacts (created at runtime by config.py, never commit)
+/reports/
+/weights/
+/logs/
+/debug_batch/
+
+# macOS
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
