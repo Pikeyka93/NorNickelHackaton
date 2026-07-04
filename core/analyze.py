@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import logging
 import os
 import time
@@ -89,6 +90,66 @@ def _png_b64(bgr: "np.ndarray") -> str:
     return base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
 
 
+def _pil_png_b64(image) -> str:
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _source_to_pil_rgb(source: ImageInput):
+    from PIL import Image
+
+    if isinstance(source, (str, Path)):
+        return Image.open(source).convert("RGB")
+    if isinstance(source, (bytes, bytearray)):
+        return Image.open(io.BytesIO(bytes(source))).convert("RGB")
+    if hasattr(source, "shape"):
+        arr = source
+        if getattr(arr, "ndim", 0) == 2:
+            return Image.fromarray(arr).convert("RGB")
+        if getattr(arr, "ndim", 0) == 3:
+            return Image.fromarray(arr[..., :3]).convert("RGB")
+    raise ValueError("unsupported image source for demo overlay")
+
+
+def _stub_overlay_b64(source: ImageInput) -> str:
+    """Visible no-cv2 demo overlay for local videos."""
+    try:
+        from PIL import Image, ImageChops, ImageFilter
+
+        img = _source_to_pil_rgb(source)
+        max_side = 2200
+        if max(img.size) > max_side:
+            scale = max_side / max(img.size)
+            img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                             Image.Resampling.LANCZOS)
+
+        gray = img.convert("L").filter(ImageFilter.GaussianBlur(radius=max(2, min(img.size) // 180)))
+        values = list(gray.getdata())
+        if not values:
+            return ""
+
+        idx = max(0, min(len(values) - 1, int(len(values) * 0.075)))
+        threshold = sorted(values)[idx]
+        mask = gray.point(lambda p: 255 if p <= threshold else 0, "L")
+        mask = mask.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(11))
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=1))
+
+        alpha = mask.point(lambda p: int(p * 0.58))
+        blue = Image.new("RGB", img.size, (0, 56, 220))
+        out = Image.composite(blue, img, alpha)
+
+        edge = ImageChops.subtract(mask.filter(ImageFilter.MaxFilter(7)),
+                                   mask.filter(ImageFilter.MinFilter(7)))
+        edge_alpha = edge.point(lambda p: 230 if p > 0 else 0)
+        outline = Image.new("RGB", img.size, (0, 34, 190))
+        out = Image.composite(outline, out, edge_alpha)
+        return _pil_png_b64(out)
+    except Exception as e:
+        log.info("stub overlay unavailable for demo (%s)", type(e).__name__)
+        return ""
+
+
 def _image_id(source: ImageInput, explicit: Optional[str]) -> str:
     if explicit:
         return explicit
@@ -102,7 +163,7 @@ def _image_id(source: ImageInput, explicit: Optional[str]) -> str:
 # --------------------------------------------------------------------------- #
 # Заглушка
 # --------------------------------------------------------------------------- #
-def _stub_result(image_id: str, t0: float, reason: str) -> dict:
+def _stub_result(image_id: str, t0: float, reason: str, image: ImageInput) -> dict:
     log.info("stub result for %s (%s)", image_id, reason)
     talc_pct = 4.0
     verdict = C.CLASS_ORDINARY
@@ -110,7 +171,7 @@ def _stub_result(image_id: str, t0: float, reason: str) -> dict:
         "image_id": image_id,
         "verdict": verdict,
         "talc_pct": talc_pct,
-        "talc_mask_png_b64": "",
+        "talc_mask_png_b64": _stub_overlay_b64(image),
         "consistency_check": consistency_check(verdict, talc_pct),
         "classifier_confidence": None,
         "processing_time_sec": round(time.time() - t0, 3),
@@ -129,13 +190,13 @@ def analyze(image: ImageInput, image_id: Optional[str] = None,
 
     if not _HAS_SEG or os.environ.get("ANALYZE_STUB") == "1":
         reason = "ANALYZE_STUB" if _HAS_SEG else f"no_segmentation({type(_SEG_ERR).__name__})"
-        return _stub_result(iid, t0, reason)
+        return _stub_result(iid, t0, reason, image)
 
     try:
         seg = segment.analyze_image(image)
     except Exception as e:  # не роняем API на кривом снимке
         log.exception("segmentation failed for %s: %s", iid, e)
-        return _stub_result(iid, t0, f"seg_error:{type(e).__name__}")
+        return _stub_result(iid, t0, f"seg_error:{type(e).__name__}", image)
 
     talc_pct = seg["talc_pct"]
 

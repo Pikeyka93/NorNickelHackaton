@@ -53,7 +53,7 @@ _LEGEND = '<span style="color:#1656c9;font-size:1.15em;">■</span> тальк (
 
 
 @st.cache_data(show_spinner=False)
-def _cached_analyze(data: bytes, image_id: str) -> dict:
+def _cached_analyze(data: bytes, image_id: str, cache_version: str = "mask_fallback_v2") -> dict:
     return analyze_mod.analyze(data, image_id=image_id)
 
 
@@ -68,11 +68,26 @@ _CSS = """
     --nn-border: #e7eaf1;
 }
 
-html, body, [class*="css"] { font-family: 'Manrope', -apple-system, sans-serif !important; }
+html, body, [class*="css"] {
+    font-family: 'Manrope', -apple-system, sans-serif !important;
+    background: #f2f5fb !important;
+}
 
 /* убрать дефолтный тулбар/футер Streamlit, чтобы не выглядело как дев-стенд */
-#MainMenu, footer, div[data-testid="stToolbar"] { visibility: hidden; height: 0; }
-.block-container { padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1220px; }
+#MainMenu,
+footer,
+header,
+[data-testid="stHeader"],
+[data-testid="stDecoration"],
+[data-testid="stToolbar"],
+[data-testid="stStatusWidget"],
+.stAppHeader {
+    display: none !important;
+    visibility: hidden !important;
+    height: 0 !important;
+    min-height: 0 !important;
+}
+.block-container { padding-top: .6rem; padding-bottom: 3rem; max-width: 1220px; }
 
 /* фон вместо плоского белого/серого — мягкие цветные пятна на светлой подложке */
 [data-testid="stAppViewContainer"], .stApp {
@@ -224,10 +239,8 @@ def _decode_png_b64(b64: str) -> np.ndarray | None:
     """base64 PNG (BGR) -> RGB-массив."""
     if not b64:
         return None
-    import cv2
-    buf = np.frombuffer(base64.b64decode(b64), np.uint8)
-    bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) if bgr is not None else None
+    from PIL import Image
+    return np.asarray(Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"))
 
 
 def _decode_original(data: bytes) -> np.ndarray:
@@ -264,6 +277,20 @@ def _array_to_data_url(img: np.ndarray, max_side: int = 2200) -> str:
     pil.save(buf, format="PNG")
     encoded = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+def _array_to_png_bytes(img: np.ndarray, max_side: int = 2200) -> bytes:
+    from PIL import Image
+    arr = img.astype(np.uint8) if img.dtype != np.uint8 else img
+    h, w = arr.shape[:2]
+    pil = Image.fromarray(arr)
+    if max(h, w) > max_side:
+        scale = max_side / max(h, w)
+        pil = pil.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                         Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _viewer_id(key: str) -> str:
@@ -570,7 +597,7 @@ for file in files:
     # analyze() в try/except: кривой файл не должен ронять всё приложение (живой деплой!)
     try:
         with st.spinner(f"Анализирую {file.name}…"):
-            result = _cached_analyze(data, file.name)
+            result = _cached_analyze(data, file.name, "mask_fallback_v2")
     except Exception as e:
         st.error(f"Не удалось обработать «{file.name}»: {e}. "
                  "Проверьте, что это корректное изображение аншлифа.")
@@ -668,12 +695,10 @@ for file in files:
         )
 
         try:
-            import cv2
             original = _decode_original(data)
             overlay = _decode_png_b64(result.get("talc_mask_png_b64", ""))
-            orig_png = cv2.imencode(".png", cv2.cvtColor(original, cv2.COLOR_RGB2BGR))[1].tobytes()
-            ov_png = (cv2.imencode(".png", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))[1].tobytes()
-                      if overlay is not None else None)
+            orig_png = _array_to_png_bytes(original)
+            ov_png = _array_to_png_bytes(overlay) if overlay is not None else None
             pdf_path = report.build_pdf(result, original_png=orig_png, talc_overlay_png=ov_png)
             st.download_button("\U0001F4C4 Скачать PDF-отчёт", data=open(pdf_path, "rb").read(),
                                file_name=f"{result.get('image_id', 'report')}.pdf",
