@@ -111,6 +111,26 @@ def _local_variance(gray_f: np.ndarray, win: int) -> np.ndarray:
     return var / (255.0 ** 2)
 
 
+def _local_coherence(gray_f: np.ndarray, win: int) -> np.ndarray:
+    """Когерентность локальной структуры (0..1) через тензор структуры (Sobel).
+
+    0 = изотропно (нет выраженного направления градиента, как у рассеянного
+    гладкого талька), 1 = сильно направленно (как у игольчатых/призматических
+    зёрен сульфидов — они тёмные и гладкие ВНУТРИ зерна, поэтому проходят все
+    остальные признаки талька, но имеют выраженную ось вытянутости, которой у
+    талька нет). Используется как дополнительный фильтр ложных срабатываний на
+    рядовых рудах с игольчатой текстурой (см. calibrate_talc.py / TALC_MAX_COHERENCE)."""
+    gx = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)
+    gxx = cv2.boxFilter(gx * gx, -1, (win, win))
+    gyy = cv2.boxFilter(gy * gy, -1, (win, win))
+    gxy = cv2.boxFilter(gx * gy, -1, (win, win))
+    tmp = np.sqrt(np.clip((gxx - gyy) ** 2 + 4 * gxy ** 2, 0, None))
+    l1 = (gxx + gyy + tmp) / 2
+    l2 = (gxx + gyy - tmp) / 2
+    return (l1 - l2) / (l1 + l2 + 1e-6)
+
+
 def _vignette_mask(gray: np.ndarray) -> np.ndarray:
     """Маска чёрной рамки/виньетки апертуры, а НЕ талька.
 
@@ -167,6 +187,13 @@ def detect_talc(norm_bgr: np.ndarray) -> np.ndarray:
     smooth = _local_variance(gray, win) < C.TALC_MAX_TEXTURE    # (d) гладкий
     cand = matrix & smooth & (dark_abs | dark_local)
 
+    # (d2) изотропность: тальк рассеян и не имеет выраженной оси, а игольчатые
+    # сульфиды — тёмные+гладкие ВНУТРИ зерна, но вытянутые -> высокая когерентность.
+    # Без этого фильтра плотные скопления игольчатых зёрен на рядовой руде ошибочно
+    # ловятся как тальк (см. коммит с "needle-grain false positive").
+    isotropic = _local_coherence(gray, win) < C.TALC_MAX_COHERENCE
+    cand = cand & isotropic
+
     # (e) регион-контраст: оценить фон по ОКРУЖАЮЩЕМУ гангу (исключая тёмные кандидаты)
     # и оставить только пиксели, что темнее этого фона -> отсекает плавные тёмные
     # вариации матрицы, сохраняя интерьер настоящих тальк-зон.
@@ -179,7 +206,17 @@ def detect_talc(norm_bgr: np.ndarray) -> np.ndarray:
 
     talc = (cand & contrast_ok & ~vignette).astype(np.uint8) * 255
     talc = cv2.morphologyEx(talc, cv2.MORPH_OPEN, _K5)
-    talc = cv2.morphologyEx(talc, cv2.MORPH_CLOSE, _K5)
+    # Укрупнение формы: реальный тальк — большие сплошные пятна (см. эталонные
+    # обводки), а не пиксельная рябь. Раньше closing был фиксирован на 5px, из-за
+    # чего кандидаты (даже верные, внутри настоящих тальк-зон) оставались
+    # рассыпанными точками -> IoU с эталоном был ~0.05-0.07 при формально похожем
+    # проценте площади (ложный шум в других местах кадра компенсировал недобор
+    # внутри реальных зон). TALC_MORPH_CLOSE_KERNEL мержит соседние кандидаты в
+    # сплошные пятна; TALC_MIN_BLOB_AREA после этого отсекает то, что не срослось
+    # в пятно нужного масштаба (шум), а не мелкие внутренние вкрапления талька.
+    close_k = C.TALC_MORPH_CLOSE_KERNEL | 1
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+    talc = cv2.morphologyEx(talc, cv2.MORPH_CLOSE, close_kernel)
     return _drop_small(talc, C.TALC_MIN_BLOB_AREA)
 
 

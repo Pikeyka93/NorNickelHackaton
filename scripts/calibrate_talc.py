@@ -62,20 +62,33 @@ MIN_BLUE_PIXELS = 200  # порог "заметных" синих пикселе
 # Расширены после первого прохода калибровки: найденный оптимум упирался в границы
 # TALC_MAX_TEXTURE (0.03, нижняя) и TALC_ABS_MARGIN (32.2, близко к 40) — открываем
 # диапазон дальше в ту же сторону, вдруг там сидит более точный минимум.
+# ВАЖНО (найдено при разборе визуального несоответствия эталону, см. историю
+# коммитов): узкие диапазоны ниже давали похожий % площади талька, но почти БЕЗ
+# пространственного перекрытия с эталоном (mean_iou ~0.05-0.07) — детектор
+# находил <=30% пикселей ВНУТРИ настоящих тальк-зон и добирал недостающий
+# процент шумом по всему остальному кадру. Диапазоны расширены, чтобы поиск мог
+# найти более рыхлые пороги (выше recall внутри зоны) в связке с укрупнением
+# формы (TALC_MORPH_CLOSE_KERNEL) и более строгим TALC_MIN_BLOB_AREA /
+# TALC_CONTRAST_MARGIN для отсечения шума СНАРУЖИ, вместо отсечения пикселей
+# ВНУТРИ реального талька.
 PARAM_SPACE: dict[str, tuple[float, float]] = {
     "TALC_BRIGHT_EXCLUDE_PERCENTILE": (65, 97),
     "TALC_DARK_PERCENTILE": (15, 70),
-    "TALC_ABS_MARGIN": (5.0, 55.0),
-    "TALC_LOCAL_MARGIN": (2.0, 20.0),
-    "TALC_MAX_TEXTURE": (0.01, 0.18),
-    "TALC_CONTRAST_MARGIN": (5.0, 45.0),
-    "TALC_MIN_BLOB_AREA": (30, 500),
+    "TALC_ABS_MARGIN": (0.0, 55.0),
+    "TALC_LOCAL_MARGIN": (0.0, 20.0),
+    "TALC_MAX_TEXTURE": (0.01, 0.30),
+    "TALC_CONTRAST_MARGIN": (5.0, 80.0),
+    "TALC_MIN_BLOB_AREA": (30, 6000),
     # Изотропность (structure-tensor coherence, _local_coherence в core/segment.py):
     # добавлено для фильтрации ложного талька на игольчатых сульфидных зёрнах
     # (тёмные+гладкие внутри зерна, но вытянутые вдоль оси — тальк изотропен).
     "TALC_MAX_COHERENCE": (0.15, 0.55),
+    # Укрупнение формы кандидатов перед TALC_MIN_BLOB_AREA (см. core/segment.py).
+    "TALC_MORPH_CLOSE_KERNEL": (5, 31),
 }
-INT_PARAMS = {"TALC_BRIGHT_EXCLUDE_PERCENTILE", "TALC_DARK_PERCENTILE", "TALC_MIN_BLOB_AREA"}
+INT_PARAMS = {"TALC_BRIGHT_EXCLUDE_PERCENTILE", "TALC_DARK_PERCENTILE", "TALC_MIN_BLOB_AREA",
+              "TALC_MORPH_CLOSE_KERNEL"}
+ODD_PARAMS = {"TALC_MORPH_CLOSE_KERNEL"}  # должны быть нечётными (размер ядра)
 
 
 @dataclass
@@ -213,15 +226,30 @@ def evaluate(params: dict, samples: list[CalibSample]) -> dict:
 
 
 def score(metrics: dict) -> float:
-    """Ниже — лучше. Главная цель брифа: |Δtalc_pct| <= 3%; IoU — тай-брейк."""
-    return metrics["mean_abs_err_pct"] + (1.0 - metrics["mean_iou"]) * 2.0
+    """Ниже — лучше.
+
+    ВАЖНО: IoU здесь — НЕ тай-брейк, а основной сигнал (вес x8). Раньше (вес x2,
+    |Δtalc_pct| первым слагаемым без веса) поиск легко находил конфигурации с
+    похожим % площади талька, но почти без пространственного перекрытия с
+    эталоном (детектор ловил шум по всему кадру вместо настоящих зон талька,
+    mean_iou ~0.05-0.07) — см. историю коммитов. |Δtalc_pct| остаётся в цели
+    брифа (<=3%), но получить его "случайным" совпадением площади при плохой
+    форме маски больше не должно давать низкий score."""
+    return metrics["mean_abs_err_pct"] + (1.0 - metrics["mean_iou"]) * 8.0
+
+
+def _snap(name: str, v: float) -> float | int:
+    if name in ODD_PARAMS:
+        vi = int(round(v))
+        return vi if vi % 2 == 1 else vi + 1
+    return int(round(v)) if name in INT_PARAMS else round(v, 2)
 
 
 def random_params(rng: random.Random) -> dict:
     out = {}
     for name, (lo, hi) in PARAM_SPACE.items():
         v = rng.uniform(lo, hi)
-        out[name] = int(round(v)) if name in INT_PARAMS else round(v, 2)
+        out[name] = _snap(name, v)
     return out
 
 
@@ -234,7 +262,7 @@ def coordinate_refine(best_params: dict, best_metrics: dict, samples: list[Calib
         span = hi - lo
         cand = best_params[name] + span * rng.uniform(-0.15, 0.15)
         cand = max(lo, min(hi, cand))
-        cand = int(round(cand)) if name in INT_PARAMS else round(cand, 2)
+        cand = _snap(name, cand)
         trial = dict(best_params)
         trial[name] = cand
         m = evaluate(trial, samples)
