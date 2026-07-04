@@ -59,14 +59,21 @@ EXPERT_SUBDIR_KEYWORDS = ("облас", "тальк", "оталь")
 MIN_BLUE_PIXELS = 200  # порог "заметных" синих пикселей, иначе считаем шумом
 
 # Параметры, которые крутим, и диапазоны поиска (см. TODO(P1) в config.py).
+# Расширены после первого прохода калибровки: найденный оптимум упирался в границы
+# TALC_MAX_TEXTURE (0.03, нижняя) и TALC_ABS_MARGIN (32.2, близко к 40) — открываем
+# диапазон дальше в ту же сторону, вдруг там сидит более точный минимум.
 PARAM_SPACE: dict[str, tuple[float, float]] = {
-    "TALC_BRIGHT_EXCLUDE_PERCENTILE": (70, 95),
-    "TALC_DARK_PERCENTILE": (30, 70),
-    "TALC_ABS_MARGIN": (10.0, 40.0),
-    "TALC_LOCAL_MARGIN": (3.0, 15.0),
-    "TALC_MAX_TEXTURE": (0.03, 0.15),
-    "TALC_CONTRAST_MARGIN": (10.0, 35.0),
-    "TALC_MIN_BLOB_AREA": (50, 400),
+    "TALC_BRIGHT_EXCLUDE_PERCENTILE": (65, 97),
+    "TALC_DARK_PERCENTILE": (15, 70),
+    "TALC_ABS_MARGIN": (5.0, 55.0),
+    "TALC_LOCAL_MARGIN": (2.0, 20.0),
+    "TALC_MAX_TEXTURE": (0.01, 0.18),
+    "TALC_CONTRAST_MARGIN": (5.0, 45.0),
+    "TALC_MIN_BLOB_AREA": (30, 500),
+    # Изотропность (structure-tensor coherence, _local_coherence в core/segment.py):
+    # добавлено для фильтрации ложного талька на игольчатых сульфидных зёрнах
+    # (тёмные+гладкие внутри зерна, но вытянутые вдоль оси — тальк изотропен).
+    "TALC_MAX_COHERENCE": (0.15, 0.55),
 }
 INT_PARAMS = {"TALC_BRIGHT_EXCLUDE_PERCENTILE", "TALC_DARK_PERCENTILE", "TALC_MIN_BLOB_AREA"}
 
@@ -273,6 +280,13 @@ def main() -> None:
     ap.add_argument("--time-budget-sec", type=float, default=None,
                     help="остановить перебор (не начинать новую попытку), если вышло время — "
                          "для запуска короткими кусками под ограничение по времени вызова")
+    ap.add_argument("--skip-baseline-eval", action="store_true",
+                    help="не пересчитывать метрики текущего config.py (для отчёта) — "
+                         "экономит один полный evaluate() при дроблении на много запусков")
+    ap.add_argument("--trust-resume-metrics", action="store_true",
+                    help="не пересчитывать evaluate() для --resume-from (доверять metrics "
+                         "из отчёта как есть) — экономит ещё один полный evaluate() на "
+                         "той же выборке при дроблении на много коротких запусков подряд")
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -293,17 +307,43 @@ def main() -> None:
     print(f"[calibrate_talc] эталон: {n_blue} через синие обводки, {n_mask} как готовая маска")
 
     baseline_params = {k: getattr(C, k) for k in PARAM_SPACE}
-    baseline_metrics = evaluate(baseline_params, samples)
-    print(f"[calibrate_talc] базовые (текущие) параметры: {baseline_metrics}")
+    if args.skip_baseline_eval and args.resume_from:
+        baseline_metrics = {"mean_abs_err_pct": None, "max_abs_err_pct": None, "mean_iou": None}
+        print("[calibrate_talc] базовые метрики пропущены (--skip-baseline-eval)")
+    else:
+        baseline_metrics = evaluate(baseline_params, samples)
+        print(f"[calibrate_talc] базовые (текущие) параметры: {baseline_metrics}")
 
     # --resume-from: продолжаем поиск от лучшей точки предыдущего запуска, а не от
     # config.py — так можно дробить долгий перебор на много коротких запусков подряд.
+    # Засекаем время ЭТОГО evaluate() — это наша единственная надёжная оценка
+    # "секунд на одну попытку" ДО того, как случайные trials вообще начались (важно
+    # для --trials 0: без неё клэмп refine_steps по времени не работал и вылетал
+    # за пределы вызова, см. историю коммитов).
     start_params, start_metrics = baseline_params, baseline_metrics
+    t_eval0 = time.time()
     if args.resume_from:
         prev = json.loads(Path(args.resume_from).read_text(encoding="utf-8"))
         start_params = prev["best"]["params"]
-        start_metrics = evaluate(start_params, samples)  # пересчитываем на ТЕКУЩЕЙ выборке
-        print(f"[calibrate_talc] продолжаю от {args.resume_from}: {start_metrics}")
+        # заполняем недостающие параметры (напр. добавленные позже, как TALC_MAX_COHERENCE)
+        # текущими значениями config.py, чтобы старые отчёты оставались совместимы
+        for k in PARAM_SPACE:
+            start_params.setdefault(k, getattr(C, k))
+        if args.trust_resume_metrics and "metrics" in prev.get("best", {}):
+            start_metrics = prev["best"]["metrics"]
+            # нет реального замера -> консервативная оценка по числу сэмплов (эмпирически
+            # ~0.4s/сэмпл на полном тайлинге), чтобы safe_cap всё равно защищал от переезда
+            # за пределы --time-budget-sec (см. историю бага с --trials 0)
+            per_eval_estimate = max(0.4 * len(samples), 0.05)
+            print(f"[calibrate_talc] продолжаю от {args.resume_from} (metrics не пересчитаны, "
+                  f"--trust-resume-metrics): {start_metrics}")
+        else:
+            t_eval0 = time.time()
+            start_metrics = evaluate(start_params, samples)  # пересчитываем на ТЕКУЩЕЙ выборке
+            per_eval_estimate = max(time.time() - t_eval0, 0.05)
+            print(f"[calibrate_talc] продолжаю от {args.resume_from}: {start_metrics}")
+    else:
+        per_eval_estimate = max(time.time() - t_eval0, 0.05)
 
     rng = random.Random(args.seed)
     best_params, best_metrics = start_params, start_metrics
@@ -324,8 +364,11 @@ def main() -> None:
     refine_steps = args.refine_steps
     if deadline:
         remaining = deadline - time.time()
-        per_eval = (time.time() - t0) / max(trials_done, 1)
-        refine_steps = max(0, min(refine_steps, int(remaining / max(per_eval, 0.01))))
+        per_eval = ((time.time() - t0) / trials_done) if trials_done else per_eval_estimate
+        # доп. защита от переоценки скорости (напр. --trials 0 без --resume-from):
+        # никогда не рискуем больше, чем remaining/per_eval_estimate_как_худший_случай
+        safe_cap = int(remaining / max(per_eval_estimate, 0.01))
+        refine_steps = max(0, min(refine_steps, int(remaining / max(per_eval, 0.01)), safe_cap))
     best_params, best_metrics = coordinate_refine(
         best_params, best_metrics, samples, rng, steps=refine_steps)
     dt = time.time() - t0
