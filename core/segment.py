@@ -269,12 +269,27 @@ def segment_talc(bgr: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 def build_talc_overlay(bgr: np.ndarray, talc_mask: np.ndarray,
                        alpha: float = C.MASK_ALPHA) -> np.ndarray:
-    """Синяя полупрозрачная маска талька поверх снимка (BGR)."""
+    """Синяя маска талька поверх снимка (BGR) — контур линией + лёгкая заливка,
+    как в экспертной разметке (обводка, а не сплошная закраска). Сплошная заливка
+    визуально сливалась в кляксы и не читалась как "область талька" — обводка
+    линией даёт тот же визуальный язык, что и эталон (см. Области оталькования)."""
     out = bgr.copy()
-    blue = np.zeros_like(bgr)
-    blue[:] = C.COLOR_TALC
-    m = talc_mask > 0
-    out[m] = cv2.addWeighted(bgr, 1 - alpha, blue, alpha, 0)[m]
+
+    # лёгкая заливка (по брифу нужна маска; делаем её едва заметной, не основной)
+    if alpha > 0:
+        blue = np.zeros_like(bgr)
+        blue[:] = C.COLOR_TALC
+        m = talc_mask > 0
+        out[m] = cv2.addWeighted(bgr, 1 - alpha, blue, alpha, 0)[m]
+
+    # контур поверх заливки — основной визуальный акцент, как у эксперта.
+    # RETR_EXTERNAL (не RETR_LIST): только внешняя граница каждого пятна, без
+    # внутренних дырок-контуров — эксперт тоже обводит ПО ВНЕШНЕМУ КОНТУРУ зоны,
+    # не вырезая мелкие внутренние вкрапления отдельными линиями.
+    contours, _ = cv2.findContours((talc_mask > 0).astype(np.uint8),
+                                    cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    thickness = max(2, round(0.002 * max(bgr.shape[:2])))
+    cv2.drawContours(out, contours, -1, C.COLOR_TALC, thickness, lineType=cv2.LINE_AA)
     return out
 
 
