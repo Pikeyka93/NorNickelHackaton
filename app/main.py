@@ -579,7 +579,7 @@ files = st.file_uploader(
     "Загрузите снимок(и) аншлифа / панораму (TIFF / PNG / JPEG)",
     type=["tif", "tiff", "png", "jpg", "jpeg", "bmp"],
     accept_multiple_files=True,
-    label_visibility="collapsed",
+    label_visibility="visible",
 )
 
 if not files:
@@ -771,7 +771,7 @@ if all_results:
         st.markdown(table_html, unsafe_allow_html=True)
     with sum_r:
         counts = df["Сорт"].value_counts()
-        st.bar_chart(counts)
+       #st.bar_chart(counts)
 
     st.download_button("⬇️ Скачать CSV (все изображения)",
                        data=report.results_to_csv(all_results).encode("utf-8"),
